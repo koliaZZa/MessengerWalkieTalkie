@@ -1,32 +1,26 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(MessengerServer LANGUAGES CXX)
+project(MessengerClient LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Core Network Sql)
+find_package(Qt6 REQUIRED COMPONENTS Core Network Widgets)
 
-add_executable(server
+add_executable(client WIN32
     main.cpp
-    server.cpp
-    server.h
+    chatwindow.cpp
+    chatwindow.h
+    networkclient.cpp
+    networkclient.h
     protocol.h
-    logger.cpp
-    logger.h
-    connection.cpp
-    connection.h
-    worker.cpp
-    worker.h
-    authservice.cpp
-    authservice.h
 )
 
-target_link_libraries(server
+target_link_libraries(client
     Qt6::Core
     Qt6::Network
-    Qt6::Sql
+    Qt6::Widgets
 )
 
 if (WIN32)
@@ -39,13 +33,13 @@ if (WIN32)
         set(QT_WINDEPLOYQT_MODE --debug)
     endif()
 
-    add_custom_command(TARGET server POST_BUILD
+    add_custom_command(TARGET client POST_BUILD
         COMMAND "${QT_WINDEPLOYQT_EXECUTABLE}"
             ${QT_WINDEPLOYQT_MODE}
             --compiler-runtime
             --no-translations
-            "$<TARGET_FILE:server>"
-        COMMENT "Deploying Qt runtime for server"
+            "$<TARGET_FILE:client>"
+        COMMENT "Deploying Qt runtime for client"
         VERBATIM
     )
 endif()

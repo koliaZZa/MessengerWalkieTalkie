@@ -1,14 +1,15 @@
 #include <QCoreApplication>
+
 #include "server.h"
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
-    QCoreApplication a(argc, argv);
+    QCoreApplication application(argc, argv);
 
-    MessengerServer server;
+    Server server;
     if (!server.start(5555)) {
         return -1;
     }
 
-    return a.exec();
+    return application.exec();
 }

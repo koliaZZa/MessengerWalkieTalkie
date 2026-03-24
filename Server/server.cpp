@@ -1,222 +1,339 @@
 #include "server.h"
-#include <QDebug>
 
-MessengerServer::MessengerServer(QObject *parent)
+#include "connection.h"
+#include "logger.h"
+#include "worker.h"
+
+#include <QCoreApplication>
+#include <QHostAddress>
+#include <QJsonArray>
+#include <QMetaObject>
+#include <QTcpSocket>
+#include <QThread>
+#include <algorithm>
+
+Server::Server(QObject* parent)
     : QObject(parent)
 {
-    connect(&server, &QTcpServer::newConnection,
-            this, &MessengerServer::onNewConnection);
-
-    loadUsers();
+    qRegisterMetaType<Connection*>("Connection*");
 }
 
-MessengerServer::~MessengerServer()
+Server::~Server()
 {
-    saveUsers();
+    m_tcpServer.close();
 
-    for (auto* session : sessions) {
-        session->socket->close();
-        delete session;
+    {
+        QMutexLocker locker(&m_mutex);
+        const auto connections = m_allConnections.keys();
+        for (Connection* connection : connections) {
+            QMetaObject::invokeMethod(connection, &Connection::closeConnection, Qt::QueuedConnection);
+        }
     }
+
+    qDeleteAll(m_workers);
+    Logger::instance().stop();
 }
 
-bool MessengerServer::start(quint16 port)
+bool Server::start(quint16 port)
 {
-    if (!server.listen(QHostAddress::Any, port)) {
-        qCritical() << "Server failed to start";
+    Logger::instance().start();
+
+    if (!m_authService.init()) {
+        Logger::instance().log(LogLevel::Error, QStringLiteral("Failed to initialize auth storage"));
         return false;
     }
 
-    qDebug() << "Server started on port" << port;
-    return true;
+    connect(&m_tcpServer, &QTcpServer::newConnection, this, &Server::onNewConnection);
+    connect(&m_tcpServer, &QTcpServer::acceptError, this, &Server::onAcceptError);
+    connect(qApp, &QCoreApplication::aboutToQuit, this, [this]() {
+        m_tcpServer.close();
+    });
+
+    const int workerCount = qMax(2, QThread::idealThreadCount());
+    for (int i = 0; i < workerCount; ++i) {
+        auto* worker = new Worker();
+        connect(worker, &Worker::connectionReady, this, &Server::onConnectionReady, Qt::QueuedConnection);
+        m_workers.append(worker);
+    }
+
+    const bool ok = m_tcpServer.listen(QHostAddress::AnyIPv4, port);
+    if (ok) {
+        Logger::instance().log(LogLevel::Info,
+                               QStringLiteral("Server listening on port %1").arg(port));
+    }
+
+    return ok;
 }
 
-void MessengerServer::onNewConnection()
+void Server::onNewConnection()
 {
-    QTcpSocket* socket = server.nextPendingConnection();
+    while (m_tcpServer.hasPendingConnections()) {
+        QTcpSocket* pendingSocket = m_tcpServer.nextPendingConnection();
+        if (!pendingSocket) {
+            continue;
+        }
 
-    ClientSession* session = new ClientSession;
-    session->socket = socket;
+        pendingSocket->setParent(nullptr);
 
-    sessions[socket] = session;
-
-    connect(socket, &QTcpSocket::readyRead,
-            this, &MessengerServer::onReadyRead);
-
-    connect(socket, &QTcpSocket::disconnected,
-            this, &MessengerServer::onClientDisconnected);
-
-    qDebug() << "New client connected";
+        Worker* worker = m_workers.at(m_nextWorkerIndex % m_workers.size());
+        ++m_nextWorkerIndex;
+        pendingSocket->moveToThread(worker->threadHandle());
+        worker->attachSocket(pendingSocket);
+    }
 }
 
-void MessengerServer::onReadyRead()
+void Server::onConnectionReady(Connection* connection)
 {
-    QTcpSocket* socket = qobject_cast<QTcpSocket*>(sender());
-    ClientSession* session = sessions[socket];
+    {
+        QMutexLocker locker(&m_mutex);
+        m_allConnections.insert(connection, true);
+    }
 
-    while (socket->canReadLine()) {
-        QByteArray data = socket->readLine().trimmed();
+    connect(connection, &Connection::packetReceived, this, &Server::onPacketReceived, Qt::QueuedConnection);
+    connect(connection, &Connection::closed, this, &Server::onConnectionClosed, Qt::QueuedConnection);
+}
 
-        QJsonParseError error;
-        QJsonDocument doc = QJsonDocument::fromJson(data, &error);
+void Server::onPacketReceived(Connection* connection, const QJsonObject& packet)
+{
+    const QString type = packet.value("type").toString();
+    auto loginConnection = [this, connection](const QString& username, QString& errorMessage) {
+        QMutexLocker locker(&m_mutex);
 
-        if (error.error != QJsonParseError::NoError) {
-            sendError(socket, "Invalid JSON");
+        const QString currentUsername = m_connectionUsers.value(connection);
+        if (!currentUsername.isEmpty() && currentUsername != username) {
+            m_onlineUsers.remove(currentUsername);
+            m_connectionUsers.remove(connection);
+        }
+
+        if (m_onlineUsers.contains(username) && m_onlineUsers.value(username) != connection) {
+            errorMessage = QStringLiteral("User already logged in");
+            return false;
+        }
+
+        m_onlineUsers.insert(username, connection);
+        m_connectionUsers.insert(connection, username);
+        return true;
+    };
+
+    if (type == "register") {
+        const QString username = packet.value("username").toString().trimmed();
+        QString errorMessage;
+        const bool ok = m_authService.registerUser(username,
+                                                   packet.value("password").toString(),
+                                                   errorMessage);
+
+        if (!ok) {
+            sendTo(connection, {{"type", "auth_error"}, {"message", errorMessage}});
             return;
         }
 
-        processMessage(session, doc.object());
-    }
-}
+        if (!loginConnection(username, errorMessage)) {
+            sendTo(connection, {{"type", "auth_error"}, {"message", errorMessage}});
+            return;
+        }
 
-void MessengerServer::processMessage(ClientSession* client, const QJsonObject& obj)
-{
-    QString type = obj["type"].toString();
-
-    if (type == "register")
-        handleRegister(client, obj);
-    else if (type == "login")
-        handleLogin(client, obj);
-    else if (type == "message")
-        handleChatMessage(client, obj);
-    else if (type == "broadcast")
-        handleBroadcast(client, obj);
-    else
-        sendError(client->socket, "Unknown message type");
-}
-
-void MessengerServer::handleRegister(ClientSession* client, const QJsonObject& obj)
-{
-    QString username = obj["username"].toString();
-    QString password = obj["password"].toString();
-
-    if (registeredUsers.contains(username)) {
-        sendError(client->socket, "User already exists");
+        sendTo(connection, {{"type", "auth_ok"}, {"username", username}});
+        broadcastUsers();
         return;
     }
 
-    registeredUsers[username] = hashPassword(password);
-    saveUsers();
+    if (type == "login") {
+        const QString username = packet.value("username").toString().trimmed();
+        QString errorMessage;
 
-    sendJson(client->socket, {{"type", "auth_ok"}});
+        if (!m_authService.loginUser(username, packet.value("password").toString(), errorMessage)) {
+            sendTo(connection, {{"type", "auth_error"}, {"message", errorMessage}});
+            return;
+        }
+
+        if (!loginConnection(username, errorMessage)) {
+            sendTo(connection, {{"type", "auth_error"}, {"message", errorMessage}});
+            return;
+        }
+
+        sendTo(connection, {{"type", "auth_ok"}, {"username", username}});
+        broadcastUsers();
+        return;
+    }
+
+    if (type == "check_user") {
+        const QString username = packet.value("username").toString().trimmed();
+        bool online = false;
+
+        {
+            QMutexLocker locker(&m_mutex);
+            online = m_onlineUsers.contains(username);
+        }
+
+        sendTo(connection,
+               {
+                   {"type", "user_check_result"},
+                   {"username", username},
+                   {"exists", m_authService.userExists(username)},
+                   {"online", online}
+               });
+        return;
+    }
+
+    const QString from = usernameFor(connection);
+    if (from.isEmpty()) {
+        sendTo(connection, {{"type", "auth_error"}, {"message", "Please login first"}});
+        return;
+    }
+
+    if (type == "message") {
+        QList<Connection*> recipients;
+        {
+            QMutexLocker locker(&m_mutex);
+            recipients = m_onlineUsers.values();
+        }
+
+        for (auto* recipient : recipients) {
+            sendTo(recipient,
+                   {
+                       {"type", "message"},
+                       {"id", packet.value("id").toString()},
+                       {"from", from},
+                       {"text", packet.value("text").toString()}
+                   },
+                   true);
+        }
+        return;
+    }
+
+    if (type == "private") {
+        const QString toUsername = packet.value("to").toString().trimmed();
+        Connection* target = nullptr;
+
+        {
+            QMutexLocker locker(&m_mutex);
+            target = m_onlineUsers.value(toUsername, nullptr);
+        }
+
+        if (!target) {
+            const QString message = m_authService.userExists(toUsername)
+                                        ? QStringLiteral("User is offline")
+                                        : QStringLiteral("User not found");
+            sendTo(connection,
+                   {
+                       {"type", "error"},
+                       {"message", message},
+                       {"id", packet.value("id").toString()}
+                   });
+            return;
+        }
+
+        sendTo(target,
+               {
+                   {"type", "private"},
+                   {"id", packet.value("id").toString()},
+                   {"from", from},
+                   {"to", toUsername},
+                   {"text", packet.value("text").toString()}
+               },
+               true);
+
+        sendTo(connection,
+               {
+                   {"type", "delivered"},
+                   {"id", packet.value("id").toString()}
+               });
+        return;
+    }
+
+    if (type == "read") {
+        Connection* target = nullptr;
+        const QString toUsername = packet.value("to").toString().trimmed();
+
+        {
+            QMutexLocker locker(&m_mutex);
+            target = m_onlineUsers.value(toUsername, nullptr);
+        }
+
+        if (target) {
+            sendTo(target,
+                   {
+                       {"type", "read"},
+                       {"id", packet.value("id").toString()},
+                       {"from", from}
+                   });
+        }
+    }
 }
 
-void MessengerServer::handleLogin(ClientSession* client, const QJsonObject& obj)
+void Server::onConnectionClosed(Connection* connection)
 {
-    QString username = obj["username"].toString();
-    QString password = obj["password"].toString();
-
-    if (!registeredUsers.contains(username) ||
-        registeredUsers[username] != hashPassword(password)) {
-
-        sendJson(client->socket, {{"type", "auth_fail"}});
-        return;
-    }
-
-    client->state = ClientState::Authenticated;
-    client->username = username;
-    activeUsers[username] = client;
-
-    sendJson(client->socket, {{"type", "auth_ok"}});
+    unregisterConnection(connection);
+    broadcastUsers();
+    connection->deleteLater();
 }
 
-void MessengerServer::handleChatMessage(ClientSession* client, const QJsonObject& obj)
+void Server::onAcceptError(QAbstractSocket::SocketError)
 {
-    if (client->state != ClientState::Authenticated) {
-        sendError(client->socket, "Not authenticated");
+    Logger::instance().log(LogLevel::Error,
+                           QStringLiteral("Accept error: %1").arg(m_tcpServer.errorString()));
+}
+
+void Server::sendTo(Connection* connection, const QJsonObject& packet, bool reliable)
+{
+    if (!connection) {
         return;
     }
 
-    QString to = obj["to"].toString();
-    QString text = obj["text"].toString();
+    if (reliable) {
+        QMetaObject::invokeMethod(connection,
+                                  [connection, packet]() {
+                                      connection->sendReliable(packet);
+                                  },
+                                  Qt::QueuedConnection);
+    } else {
+        QMetaObject::invokeMethod(connection,
+                                  [connection, packet]() {
+                                      connection->sendUnreliable(packet);
+                                  },
+                                  Qt::QueuedConnection);
+    }
+}
 
-    if (!activeUsers.contains(to)) {
-        sendError(client->socket, "User not online");
-        return;
+void Server::broadcastUsers()
+{
+    QJsonArray users;
+    QList<Connection*> recipients;
+
+    {
+        QMutexLocker locker(&m_mutex);
+        QStringList usernames = m_onlineUsers.keys();
+        std::sort(usernames.begin(), usernames.end());
+        for (auto& username : usernames) {
+            users.append(username);
+        }
+        recipients = m_onlineUsers.values();
     }
 
-    QJsonObject message{
-        {"type", "message"},
-        {"from", client->username},
-        {"text", text}
+    const QJsonObject packet{
+        {"type", "users"},
+        {"list", users}
     };
 
-    sendJson(activeUsers[to]->socket, message);
-}
-
-void MessengerServer::handleBroadcast(ClientSession* client, const QJsonObject& obj)
-{
-    if (client->state != ClientState::Authenticated) {
-        sendError(client->socket, "Not authenticated");
-        return;
+    for (auto* recipient : recipients) {
+        sendTo(recipient, packet);
     }
-
-    QString text = obj["text"].toString();
-
-    QJsonObject message{
-        {"type", "broadcast"},
-        {"from", client->username},
-        {"text", text}
-    };
-
-    for (auto& user : activeUsers)
-        sendJson(user->socket, message);
 }
 
-void MessengerServer::onClientDisconnected()
+QString Server::usernameFor(Connection* connection) const
 {
-    QTcpSocket* socket = qobject_cast<QTcpSocket*>(sender());
-    ClientSession* session = sessions[socket];
-
-    if (session->state == ClientState::Authenticated)
-        activeUsers.remove(session->username);
-
-    sessions.remove(socket);
-    socket->deleteLater();
-    delete session;
-
-    qDebug() << "Client disconnected";
+    QMutexLocker locker(&m_mutex);
+    return m_connectionUsers.value(connection);
 }
 
-void MessengerServer::sendJson(QTcpSocket* socket, const QJsonObject& obj)
+void Server::unregisterConnection(Connection* connection)
 {
-    QJsonDocument doc(obj);
-    socket->write(doc.toJson(QJsonDocument::Compact) + "\n");
-}
+    QMutexLocker locker(&m_mutex);
 
-void MessengerServer::sendError(QTcpSocket* socket, const QString& message)
-{
-    sendJson(socket, {{"type", "error"}, {"message", message}});
-}
+    m_allConnections.remove(connection);
 
-QString MessengerServer::hashPassword(const QString& password)
-{
-    QByteArray hash = QCryptographicHash::hash(password.toUtf8(), QCryptographicHash::Sha256);
-    return hash.toHex();
-}
-
-void MessengerServer::loadUsers()
-{
-    QFile file("users.json");
-    if (!file.open(QIODevice::ReadOnly))
-        return;
-
-    QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
-    QJsonObject obj = doc.object();
-
-    for (auto it = obj.begin(); it != obj.end(); ++it)
-        registeredUsers[it.key()] = it.value().toString();
-}
-
-void MessengerServer::saveUsers()
-{
-    QFile file("users.json");
-    if (!file.open(QIODevice::WriteOnly))
-        return;
-
-    QJsonObject obj;
-    for (auto it = registeredUsers.begin(); it != registeredUsers.end(); ++it)
-        obj[it.key()] = it.value();
-
-    file.write(QJsonDocument(obj).toJson());
+    const QString username = m_connectionUsers.take(connection);
+    if (!username.isEmpty()) {
+        m_onlineUsers.remove(username);
+    }
 }

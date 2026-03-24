@@ -1,58 +1,48 @@
 #pragma once
 
-#include <QTcpServer>
-#include <QTcpSocket>
+#include <QObject>
+#include <QHash>
 #include <QJsonObject>
-#include <QJsonDocument>
-#include <QCryptographicHash>
-#include <QFile>
-#include <QMap>
+#include <QMutex>
+#include <QTcpServer>
+#include <QVector>
 
-enum class ClientState {
-    Connected,
-    Authenticated
-};
+#include "authservice.h"
 
-struct ClientSession {
-    QTcpSocket* socket;
-    QString username;
-    ClientState state = ClientState::Connected;
-};
+class Connection;
+class Worker;
 
-class MessengerServer : public QObject
+class Server : public QObject
 {
     Q_OBJECT
 
 public:
-    explicit MessengerServer(QObject *parent = nullptr);
-    ~MessengerServer();
+    explicit Server(QObject* parent = nullptr);
+    ~Server() override;
 
     bool start(quint16 port);
 
 private slots:
     void onNewConnection();
-    void onReadyRead();
-    void onClientDisconnected();
+    void onConnectionReady(Connection* connection);
+    void onPacketReceived(Connection* connection, const QJsonObject& packet);
+    void onConnectionClosed(Connection* connection);
+    void onAcceptError(QAbstractSocket::SocketError socketError);
 
 private:
-    void processMessage(ClientSession* client, const QJsonObject& obj);
-    void handleRegister(ClientSession* client, const QJsonObject& obj);
-    void handleLogin(ClientSession* client, const QJsonObject& obj);
-    void handleChatMessage(ClientSession* client, const QJsonObject& obj);
-    void handleBroadcast(ClientSession* client, const QJsonObject& obj);
+    void sendTo(Connection* connection, const QJsonObject& packet, bool reliable = false);
+    void broadcastUsers();
+    QString usernameFor(Connection* connection) const;
+    void unregisterConnection(Connection* connection);
 
-    void sendJson(QTcpSocket* socket, const QJsonObject& obj);
-    void sendError(QTcpSocket* socket, const QString& message);
+    QTcpServer m_tcpServer;
+    QVector<Worker*> m_workers;
+    int m_nextWorkerIndex {0};
 
-    QString hashPassword(const QString& password);
+    mutable QMutex m_mutex;
+    QHash<Connection*, QString> m_connectionUsers;
+    QHash<QString, Connection*> m_onlineUsers;
+    QHash<Connection*, bool> m_allConnections;
 
-    void loadUsers();
-    void saveUsers();
-
-private:
-    QTcpServer server;
-
-    QMap<QTcpSocket*, ClientSession*> sessions;
-    QMap<QString, ClientSession*> activeUsers;   // online users
-    QMap<QString, QString> registeredUsers;      // username -> hash
+    AuthService m_authService;
 };

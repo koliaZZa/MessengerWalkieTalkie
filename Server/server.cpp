@@ -1,10 +1,11 @@
-#include "server.h"
+﻿#include "server.h"
 
 #include "connection.h"
 #include "logger.h"
 #include "worker.h"
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QHostAddress>
 #include <QJsonArray>
 #include <QMetaObject>
@@ -20,18 +21,7 @@ Server::Server(QObject* parent)
 
 Server::~Server()
 {
-    m_tcpServer.close();
-
-    {
-        QMutexLocker locker(&m_mutex);
-        const auto connections = m_allConnections.keys();
-        for (Connection* connection : connections) {
-            QMetaObject::invokeMethod(connection, &Connection::closeConnection, Qt::QueuedConnection);
-        }
-    }
-
-    qDeleteAll(m_workers);
-    Logger::instance().stop();
+    stop();
 }
 
 bool Server::start(quint16 port)
@@ -46,7 +36,7 @@ bool Server::start(quint16 port)
     connect(&m_tcpServer, &QTcpServer::newConnection, this, &Server::onNewConnection);
     connect(&m_tcpServer, &QTcpServer::acceptError, this, &Server::onAcceptError);
     connect(qApp, &QCoreApplication::aboutToQuit, this, [this]() {
-        m_tcpServer.close();
+        stop();
     });
 
     const int workerCount = qMax(2, QThread::idealThreadCount());
@@ -65,6 +55,34 @@ bool Server::start(quint16 port)
     return ok;
 }
 
+void Server::stop()
+{
+    if (m_stopped) {
+        return;
+    }
+
+    m_stopped = true;
+    m_tcpServer.close();
+    disconnect(&m_tcpServer, nullptr, this, nullptr);
+
+    const auto workers = m_workers;
+    m_workers.clear();
+
+    {
+        QMutexLocker locker(&m_mutex);
+        m_connectionUsers.clear();
+        m_onlineUsers.clear();
+        m_allConnections.clear();
+    }
+
+    QThread* ownerThread = QThread::currentThread();
+    for (Worker* worker : workers) {
+        worker->shutdown(ownerThread);
+        delete worker;
+    }
+
+    Logger::instance().stop();
+}
 void Server::onNewConnection()
 {
     while (m_tcpServer.hasPendingConnections()) {
@@ -90,6 +108,7 @@ void Server::onConnectionReady(Connection* connection)
     }
 
     connect(connection, &Connection::packetReceived, this, &Server::onPacketReceived, Qt::QueuedConnection);
+    connect(connection, &Connection::reliablePacketAcked, this, &Server::onReliablePacketAcked, Qt::QueuedConnection);
     connect(connection, &Connection::closed, this, &Server::onConnectionClosed, Qt::QueuedConnection);
 }
 
@@ -134,6 +153,8 @@ void Server::onPacketReceived(Connection* connection, const QJsonObject& packet)
 
         sendTo(connection, {{"type", "auth_ok"}, {"username", username}});
         broadcastUsers();
+        sendDialogList(connection, username);
+        sendPendingPrivateMessages(connection, username);
         return;
     }
 
@@ -153,6 +174,8 @@ void Server::onPacketReceived(Connection* connection, const QJsonObject& packet)
 
         sendTo(connection, {{"type", "auth_ok"}, {"username", username}});
         broadcastUsers();
+        sendDialogList(connection, username);
+        sendPendingPrivateMessages(connection, username);
         return;
     }
 
@@ -181,7 +204,31 @@ void Server::onPacketReceived(Connection* connection, const QJsonObject& packet)
         return;
     }
 
+    if (type == "dialogs") {
+        sendDialogList(connection, from);
+        return;
+    }
+
+    if (type == "history") {
+        const QString otherUsername = packet.value("with").toString().trimmed();
+        const int limit = qBound(1, packet.value("limit").toInt(100), 200);
+        sendHistory(connection, from, otherUsername, limit);
+        return;
+    }
+
     if (type == "message") {
+        const QString messageId = packet.value("id").toString();
+        const qint64 createdAt = QDateTime::currentMSecsSinceEpoch();
+        if (!m_authService.storeBroadcastMessage(messageId, from, packet.value("text").toString(), createdAt)) {
+            sendTo(connection,
+                   {
+                       {"type", "error"},
+                       {"message", "Database error"},
+                       {"id", messageId}
+                   });
+            return;
+        }
+
         QList<Connection*> recipients;
         {
             QMutexLocker locker(&m_mutex);
@@ -192,9 +239,10 @@ void Server::onPacketReceived(Connection* connection, const QJsonObject& packet)
             sendTo(recipient,
                    {
                        {"type", "message"},
-                       {"id", packet.value("id").toString()},
+                       {"id", messageId},
                        {"from", from},
-                       {"text", packet.value("text").toString()}
+                       {"text", packet.value("text").toString()},
+                       {"created_at", createdAt}
                    },
                    true);
         }
@@ -203,6 +251,30 @@ void Server::onPacketReceived(Connection* connection, const QJsonObject& packet)
 
     if (type == "private") {
         const QString toUsername = packet.value("to").toString().trimmed();
+        const QString messageId = packet.value("id").toString();
+        const QString text = packet.value("text").toString();
+        const qint64 createdAt = QDateTime::currentMSecsSinceEpoch();
+
+        if (!m_authService.userExists(toUsername)) {
+            sendTo(connection,
+                   {
+                       {"type", "error"},
+                       {"message", QStringLiteral("User not found")},
+                       {"id", messageId}
+                   });
+            return;
+        }
+
+        if (!m_authService.storePrivateMessage(messageId, from, toUsername, text, createdAt)) {
+            sendTo(connection,
+                   {
+                       {"type", "error"},
+                       {"message", "Database error"},
+                       {"id", messageId}
+                   });
+            return;
+        }
+
         Connection* target = nullptr;
 
         {
@@ -211,14 +283,12 @@ void Server::onPacketReceived(Connection* connection, const QJsonObject& packet)
         }
 
         if (!target) {
-            const QString message = m_authService.userExists(toUsername)
-                                        ? QStringLiteral("User is offline")
-                                        : QStringLiteral("User not found");
             sendTo(connection,
                    {
-                       {"type", "error"},
-                       {"message", message},
-                       {"id", packet.value("id").toString()}
+                       {"type", "queued"},
+                       {"id", messageId},
+                       {"to", toUsername},
+                       {"created_at", createdAt}
                    });
             return;
         }
@@ -226,24 +296,23 @@ void Server::onPacketReceived(Connection* connection, const QJsonObject& packet)
         sendTo(target,
                {
                    {"type", "private"},
-                   {"id", packet.value("id").toString()},
+                   {"id", messageId},
                    {"from", from},
                    {"to", toUsername},
-                   {"text", packet.value("text").toString()}
+                   {"text", text},
+                   {"created_at", createdAt}
                },
                true);
-
-        sendTo(connection,
-               {
-                   {"type", "delivered"},
-                   {"id", packet.value("id").toString()}
-               });
         return;
     }
 
     if (type == "read") {
         Connection* target = nullptr;
         const QString toUsername = packet.value("to").toString().trimmed();
+        const QString messageId = packet.value("id").toString();
+        const qint64 readAt = QDateTime::currentMSecsSinceEpoch();
+
+        m_authService.markMessageRead(messageId, readAt);
 
         {
             QMutexLocker locker(&m_mutex);
@@ -254,10 +323,47 @@ void Server::onPacketReceived(Connection* connection, const QJsonObject& packet)
             sendTo(target,
                    {
                        {"type", "read"},
-                       {"id", packet.value("id").toString()},
+                       {"id", messageId},
                        {"from", from}
                    });
         }
+    }
+}
+
+void Server::onReliablePacketAcked(Connection*, const QJsonObject& packet)
+{
+    if (packet.value("type").toString() != QStringLiteral("private")) {
+        return;
+    }
+
+    const QString messageId = packet.value("id").toString();
+    const QString fromUsername = packet.value("from").toString();
+    const QString toUsername = packet.value("to").toString();
+    if (messageId.isEmpty() || fromUsername.isEmpty() || toUsername.isEmpty()) {
+        return;
+    }
+
+    const qint64 deliveredAt = QDateTime::currentMSecsSinceEpoch();
+    if (!m_authService.markMessageDelivered(messageId, deliveredAt)) {
+        Logger::instance().log(LogLevel::Error,
+                               QStringLiteral("Failed to mark message delivered: %1").arg(messageId));
+        return;
+    }
+
+    Connection* sender = nullptr;
+    {
+        QMutexLocker locker(&m_mutex);
+        sender = m_onlineUsers.value(fromUsername, nullptr);
+    }
+
+    if (sender) {
+        sendTo(sender,
+               {
+                   {"type", "delivered"},
+                   {"id", messageId},
+                   {"to", toUsername},
+                   {"created_at", packet.value("created_at").toVariant().toLongLong()}
+               });
     }
 }
 
@@ -292,6 +398,73 @@ void Server::sendTo(Connection* connection, const QJsonObject& packet, bool reli
                                       connection->sendUnreliable(packet);
                                   },
                                   Qt::QueuedConnection);
+    }
+}
+
+void Server::sendDialogList(Connection* connection, const QString& username)
+{
+    QJsonArray dialogs;
+    const QStringList values = m_authService.loadDialogUsers(username);
+    for (const QString& dialogUser : values) {
+        dialogs.append(dialogUser);
+    }
+
+    sendTo(connection,
+           {
+               {"type", "dialogs"},
+               {"list", dialogs}
+           });
+}
+
+void Server::sendHistory(Connection* connection, const QString& username, const QString& chatUser, int limit)
+{
+    if (chatUser.isEmpty()) {
+        sendTo(connection,
+               {
+                   {"type", "history"},
+                   {"with", chatUser},
+                   {"items", QJsonArray()}
+               });
+        return;
+    }
+
+    QJsonArray items;
+    const QList<HistoryMessageRecord> records = chatUser == QStringLiteral("Broadcast")
+                                                    ? m_authService.loadBroadcastHistory(limit)
+                                                    : m_authService.loadPrivateHistory(username, chatUser, limit);
+    for (const HistoryMessageRecord& record : records) {
+        items.append(QJsonObject{
+            {"id", record.id},
+            {"from", record.from},
+            {"to", record.to},
+            {"text", record.text},
+            {"status", record.status},
+            {"created_at", record.createdAt}
+        });
+    }
+
+    sendTo(connection,
+           {
+               {"type", "history"},
+               {"with", chatUser},
+               {"items", items}
+           });
+}
+
+void Server::sendPendingPrivateMessages(Connection* connection, const QString& username)
+{
+    const QList<PendingPrivateMessageRecord> records = m_authService.loadPendingPrivateMessages(username);
+    for (const PendingPrivateMessageRecord& record : records) {
+        sendTo(connection,
+               {
+                   {"type", "private"},
+                   {"id", record.id},
+                   {"from", record.from},
+                   {"to", record.to},
+                   {"text", record.text},
+                   {"created_at", record.createdAt}
+               },
+               true);
     }
 }
 
@@ -337,3 +510,4 @@ void Server::unregisterConnection(Connection* connection)
         m_onlineUsers.remove(username);
     }
 }
+

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QObject>
 #include <QHash>
@@ -26,11 +26,16 @@ private slots:
     void onNewConnection();
     void onConnectionReady(Connection* connection);
     void onPacketReceived(Connection* connection, const QJsonObject& packet);
+    void onReliablePacketAcked(Connection* connection, const QJsonObject& packet);
     void onConnectionClosed(Connection* connection);
     void onAcceptError(QAbstractSocket::SocketError socketError);
 
 private:
+    void stop();
     void sendTo(Connection* connection, const QJsonObject& packet, bool reliable = false);
+    void sendDialogList(Connection* connection, const QString& username);
+    void sendHistory(Connection* connection, const QString& username, const QString& chatUser, int limit = 100);
+    void sendPendingPrivateMessages(Connection* connection, const QString& username);
     void broadcastUsers();
     QString usernameFor(Connection* connection) const;
     void unregisterConnection(Connection* connection);
@@ -44,5 +49,9 @@ private:
     QHash<QString, Connection*> m_onlineUsers;
     QHash<Connection*, bool> m_allConnections;
 
+    bool m_stopped {false};
+
     AuthService m_authService;
 };
+
+

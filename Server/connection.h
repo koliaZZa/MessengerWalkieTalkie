@@ -25,6 +25,7 @@ public:
 
 signals:
     void packetReceived(Connection* connection, const QJsonObject& packet);
+    void reliablePacketAcked(Connection* connection, const QJsonObject& packet);
     void closed(Connection* connection);
 
 public slots:

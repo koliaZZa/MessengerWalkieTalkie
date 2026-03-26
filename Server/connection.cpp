@@ -201,7 +201,12 @@ void Connection::processIncomingPacket(const QJsonObject& packet)
     const QString type = packet.value("type").toString();
 
     if (type == "ack") {
-        m_pendingMessages.remove(packet.value("id").toString());
+        const QString messageId = packet.value("id").toString();
+        const auto it = m_pendingMessages.find(messageId);
+        if (it != m_pendingMessages.end()) {
+            emit reliablePacketAcked(this, it.value().payload);
+            m_pendingMessages.erase(it);
+        }
         return;
     }
 

@@ -1,13 +1,15 @@
-#include "chatwindow.h"
+#include "clientflowcontroller.h"
 
 #include <QApplication>
 
 int main(int argc, char* argv[])
 {
     QApplication application(argc, argv);
+    application.setApplicationName(QStringLiteral("MessengerWalkieTalkie"));
+    application.setOrganizationName(QStringLiteral("MessengerWalkieTalkie"));
 
-    ChatWindow window;
-    window.show();
+    ClientFlowController controller;
+    controller.start();
 
     return application.exec();
 }

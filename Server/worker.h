@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QObject>
 #include <QThread>
@@ -16,6 +16,7 @@ public:
 
     QThread* threadHandle();
     void attachSocket(QTcpSocket* socket);
+    void shutdown(QThread* targetThread);
 
 signals:
     void connectionReady(Connection* connection);

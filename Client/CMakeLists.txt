@@ -6,12 +6,20 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Core Network Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Core Network Widgets Sql)
 
 add_executable(client WIN32
     main.cpp
     chatwindow.cpp
     chatwindow.h
+    clientflowcontroller.cpp
+    clientflowcontroller.h
+    connectionwindow.cpp
+    connectionwindow.h
+    historystore.cpp
+    historystore.h
+    loginwindow.cpp
+    loginwindow.h
     networkclient.cpp
     networkclient.h
     protocol.h
@@ -21,6 +29,7 @@ target_link_libraries(client
     Qt6::Core
     Qt6::Network
     Qt6::Widgets
+    Qt6::Sql
 )
 
 if (WIN32)

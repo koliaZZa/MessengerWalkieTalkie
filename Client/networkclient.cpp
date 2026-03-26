@@ -11,6 +11,7 @@ namespace {
 constexpr int kRetryScheduleMs[] = {2000, 4000, 8000, 16000, 32000};
 constexpr int kPingIntervalMs = 5000;
 constexpr int kPongTimeoutMs = 15000;
+constexpr int kReconnectScheduleMs[] = {1000, 2000, 4000, 8000, 16000, 32000};
 
 }
 
@@ -28,38 +29,51 @@ NetworkClient::NetworkClient(QObject* parent)
     m_retryTimer.setInterval(1000);
     connect(&m_retryTimer, &QTimer::timeout, this, &NetworkClient::retryPendingMessages);
 
-    m_reconnectTimer.setInterval(3000);
+    m_reconnectTimer.setSingleShot(true);
     connect(&m_reconnectTimer, &QTimer::timeout, this, &NetworkClient::reconnectIfNeeded);
 }
+
 
 void NetworkClient::connectToServer(const QString& host, quint16 port)
 {
     m_host = host.trimmed().isEmpty() ? QStringLiteral("127.0.0.1") : host.trimmed();
-    m_port = port;
+    m_port = port == 0 ? 5555 : port;
     m_manualDisconnect = false;
+    m_reconnectEnabled = true;
+    m_reconnectAttempt = 0;
+    m_buffer.clear();
+    m_pendingMessages.clear();
+    m_nextOutgoingSeq = 0;
+    m_lastIncomingSeq = 0;
+    m_lastPongAtMs = 0;
 
+    m_pingTimer.stop();
+    m_retryTimer.stop();
     m_reconnectTimer.stop();
-    if (m_socket.state() != QAbstractSocket::UnconnectedState) {
-        m_socket.abort();
-    }
+    m_socket.abort();
 
-    emit statusChanged(QStringLiteral("Connecting to %1:%2").arg(m_host).arg(m_port));
-    m_socket.connectToHost(m_host, m_port);
+    startConnectAttempt();
 }
 
 void NetworkClient::disconnectFromServer()
 {
     m_manualDisconnect = true;
+    m_reconnectEnabled = false;
     m_reconnectTimer.stop();
     m_pingTimer.stop();
     m_retryTimer.stop();
     m_pendingMessages.clear();
+    m_buffer.clear();
 
     if (m_socket.state() == QAbstractSocket::UnconnectedState) {
+        emit statusChanged(QStringLiteral("Disconnected"));
         return;
     }
 
     m_socket.disconnectFromHost();
+    if (m_socket.state() != QAbstractSocket::UnconnectedState) {
+        m_socket.abort();
+    }
 }
 
 bool NetworkClient::isConnected() const
@@ -67,14 +81,29 @@ bool NetworkClient::isConnected() const
     return m_socket.state() == QAbstractSocket::ConnectedState;
 }
 
+QString NetworkClient::host() const
+{
+    return m_host;
+}
+
+quint16 NetworkClient::port() const
+{
+    return m_port;
+}
+
 void NetworkClient::login(const QString& username, const QString& password)
 {
     m_username = username.trimmed();
-    sendUnreliable({
+
+    QJsonObject packet{
         {"type", "login"},
         {"username", m_username},
-        {"password", password}
-    });
+        {"password", password},
+        {"client_mode", QStringLiteral("desktop")},
+        {"supports_history", true}
+    };
+
+    sendUnreliable(packet);
 }
 
 void NetworkClient::registerUser(const QString& username, const QString& password)
@@ -92,6 +121,20 @@ void NetworkClient::checkUserExists(const QString& username)
     sendUnreliable({
         {"type", "check_user"},
         {"username", username.trimmed()}
+    });
+}
+
+void NetworkClient::requestDialogList()
+{
+    sendUnreliable({{"type", "dialogs"}});
+}
+
+void NetworkClient::requestHistory(const QString& chatUser, int limit)
+{
+    sendUnreliable({
+        {"type", "history"},
+        {"with", chatUser},
+        {"limit", qBound(1, limit, 200)}
     });
 }
 
@@ -123,12 +166,14 @@ void NetworkClient::sendReadReceipt(const QString& recipient, const QString& mes
 
 void NetworkClient::onConnected()
 {
+    m_reconnectTimer.stop();
+    m_reconnectAttempt = 0;
     m_lastPongAtMs = nowMs();
     m_pingTimer.start();
     m_retryTimer.start();
 
     emit socketConnected();
-    emit statusChanged(QStringLiteral("Connected"));
+    emit statusChanged(QStringLiteral("Connected to %1:%2").arg(m_host).arg(m_port));
 }
 
 void NetworkClient::onDisconnected()
@@ -137,13 +182,14 @@ void NetworkClient::onDisconnected()
     m_retryTimer.stop();
 
     emit socketDisconnected();
-    emit statusChanged(QStringLiteral("Disconnected"));
 
-    if (!m_manualDisconnect && !m_reconnectTimer.isActive()) {
-        m_reconnectTimer.start();
+    if (m_manualDisconnect) {
+        emit statusChanged(QStringLiteral("Disconnected"));
+        m_manualDisconnect = false;
+        return;
     }
 
-    m_manualDisconnect = false;
+    scheduleReconnect();
 }
 
 void NetworkClient::onReadyRead()
@@ -174,6 +220,11 @@ void NetworkClient::onReadyRead()
 void NetworkClient::onSocketError(QAbstractSocket::SocketError)
 {
     emit transportError(m_socket.errorString());
+
+    if (!m_manualDisconnect && m_reconnectEnabled
+        && m_socket.state() == QAbstractSocket::UnconnectedState) {
+        scheduleReconnect();
+    }
 }
 
 void NetworkClient::sendPing()
@@ -213,9 +264,35 @@ void NetworkClient::retryPendingMessages()
 
 void NetworkClient::reconnectIfNeeded()
 {
-    if (m_socket.state() == QAbstractSocket::UnconnectedState) {
-        m_socket.connectToHost(m_host, m_port);
+    if (!m_reconnectEnabled || m_manualDisconnect) {
+        return;
     }
+
+    if (m_socket.state() == QAbstractSocket::UnconnectedState) {
+        startConnectAttempt();
+    }
+}
+
+void NetworkClient::startConnectAttempt()
+{
+    emit statusChanged(QStringLiteral("Connecting to %1:%2").arg(m_host).arg(m_port));
+    m_socket.connectToHost(m_host, m_port);
+}
+
+void NetworkClient::scheduleReconnect()
+{
+    if (!m_reconnectEnabled || m_manualDisconnect || m_reconnectTimer.isActive()) {
+        return;
+    }
+
+    const int delayMs = nextReconnectDelayMs();
+    ++m_reconnectAttempt;
+    emit reconnectScheduled(delayMs);
+    emit statusChanged(QStringLiteral("Reconnecting to %1:%2 in %3 s")
+                           .arg(m_host)
+                           .arg(m_port)
+                           .arg((delayMs + 999) / 1000));
+    m_reconnectTimer.start(delayMs);
 }
 
 void NetworkClient::sendUnreliable(const QJsonObject& packet)
@@ -297,6 +374,21 @@ void NetworkClient::processPacket(const QJsonObject& packet)
         return;
     }
 
+    if (type == "dialogs") {
+        QStringList dialogs;
+        const QJsonArray values = packet.value("list").toArray();
+        for (const QJsonValue& value : values) {
+            dialogs.append(value.toString());
+        }
+        emit dialogsReceived(dialogs);
+        return;
+    }
+
+    if (type == "history") {
+        emit historyReceived(packet.value("with").toString(), packet.value("items").toArray());
+        return;
+    }
+
     if (type == "user_check_result") {
         emit userLookupFinished(packet.value("username").toString(),
                                 packet.value("exists").toBool(),
@@ -307,19 +399,29 @@ void NetworkClient::processPacket(const QJsonObject& packet)
     if (type == "message") {
         emit publicMessageReceived(packet.value("id").toString(),
                                    packet.value("from").toString(),
-                                   packet.value("text").toString());
+                                   packet.value("text").toString(),
+                                   packet.value("created_at").toVariant().toLongLong());
         return;
     }
 
     if (type == "private") {
         emit privateMessageReceived(packet.value("id").toString(),
                                     packet.value("from").toString(),
-                                    packet.value("text").toString());
+                                    packet.value("text").toString(),
+                                    packet.value("created_at").toVariant().toLongLong());
+        return;
+    }
+
+    if (type == "queued") {
+        emit messageQueued(packet.value("id").toString(),
+                           packet.value("to").toString(),
+                           packet.value("created_at").toVariant().toLongLong());
         return;
     }
 
     if (type == "delivered") {
-        emit messageDelivered(packet.value("id").toString());
+        emit messageDelivered(packet.value("id").toString(),
+                              packet.value("created_at").toVariant().toLongLong());
         return;
     }
 
@@ -350,3 +452,10 @@ qint64 NetworkClient::nowMs() const
 {
     return QDateTime::currentMSecsSinceEpoch();
 }
+
+int NetworkClient::nextReconnectDelayMs() const
+{
+    const int index = qMin(m_reconnectAttempt, static_cast<int>(std::size(kReconnectScheduleMs)) - 1);
+    return kReconnectScheduleMs[index];
+}
+

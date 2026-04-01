@@ -1,4 +1,4 @@
-﻿#include "worker.h"
+#include "worker.h"
 
 #include "connection.h"
 
@@ -45,7 +45,7 @@ void Worker::shutdown(QThread* targetThread)
     QMetaObject::invokeMethod(this,
                               [this, targetThread]() {
                                   const auto connections = findChildren<Connection*>(QString(), Qt::FindDirectChildrenOnly);
-                                  for (Connection* connection : connections) {
+                                  for (auto connection : connections) {
                                       connection->closeConnection();
                                       delete connection;
                                   }
@@ -58,3 +58,4 @@ void Worker::shutdown(QThread* targetThread)
         m_thread.wait();
     }
 }
+

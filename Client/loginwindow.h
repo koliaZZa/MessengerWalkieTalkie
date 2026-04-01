@@ -16,9 +16,12 @@ public:
     void setEndpoint(const QString& host, quint16 port);
     void setStatusText(const QString& text);
     void setUsername(const QString& username);
-    void setPassword(const QString& password);
     void clearPassword();
     void setBusy(bool busy);
+    QString endpointText() const;
+    QString statusText() const;
+    QString username() const;
+    bool isBusy() const;
 
 signals:
     void loginRequested(const QString& username, const QString& password);

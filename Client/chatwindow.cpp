@@ -1,6 +1,7 @@
 #include "chatwindow.h"
 
 #include "networkclient.h"
+#include "../Shared/authprotocol.h"
 
 #include <QComboBox>
 #include <QDateTime>
@@ -34,15 +35,10 @@ ChatWindow::ChatWindow(HistoryStore* historyStore, NetworkClient* client, QWidge
     connect(m_client, &NetworkClient::publicMessageReceived, this, &ChatWindow::onPublicMessage);
     connect(m_client, &NetworkClient::privateMessageReceived, this, &ChatWindow::onPrivateMessage);
     connect(m_client, &NetworkClient::messageQueued, this, [this](const QString& id, const QString& to, qint64 createdAt) {
-        if (m_messagesById.contains(id)) {
-            ChatMessage& message = m_messagesById[id];
-            message.status = QStringLiteral("sending");
-            if (createdAt > 0) {
-                message.createdAt = createdAt;
-            }
-            if (!m_username.isEmpty()) {
-                m_historyStore->saveMessage(m_username, message);
-            }
+        ChatMessage message;
+        if (m_state.updateMessageStatus(id, QStringLiteral("sending"), createdAt, &message)
+            && !m_state.username().isEmpty()) {
+            m_historyStore->saveMessage(m_state.username(), message);
         }
         setStatusText(QStringLiteral("User %1 is offline. Message queued until sign in.").arg(to));
         refreshCurrentChat();
@@ -57,8 +53,8 @@ ChatWindow::ChatWindow(HistoryStore* historyStore, NetworkClient* client, QWidge
 
 void ChatWindow::activateSession(const QString& username, bool offlineMode)
 {
-    const bool userChanged = m_username != username;
-    m_username = username;
+    const bool userChanged = m_state.username() != username;
+    m_state.setUsername(username);
     m_offlineMode = offlineMode;
     m_onlineSession = !offlineMode;
 
@@ -70,7 +66,7 @@ void ChatWindow::activateSession(const QString& username, bool offlineMode)
     setWindowTitle(QStringLiteral("Messenger Walkie Talkie - %1").arg(username));
     updateUiState();
 
-    if (m_onlineSession && !m_username.isEmpty()) {
+    if (m_onlineSession && !m_state.username().isEmpty()) {
         m_client->requestDialogList();
         requestCurrentHistory();
     }
@@ -82,7 +78,7 @@ void ChatWindow::deactivateSession()
 {
     m_offlineMode = false;
     m_onlineSession = false;
-    m_username.clear();
+    m_state.setUsername(QString());
     clearLoadedHistory();
     setWindowTitle(QStringLiteral("Messenger Walkie Talkie"));
     updateUiState();
@@ -94,9 +90,14 @@ void ChatWindow::setStatusText(const QString& text)
     m_statusLabel->setText(text);
 }
 
+QString ChatWindow::statusText() const
+{
+    return m_statusLabel->text();
+}
+
 QString ChatWindow::sessionUsername() const
 {
-    return m_username;
+    return m_state.username();
 }
 
 bool ChatWindow::isOfflineMode() const
@@ -106,10 +107,7 @@ bool ChatWindow::isOfflineMode() const
 
 void ChatWindow::createPrivateDialog()
 {
-    QStringList candidates = m_onlineUsers;
-    candidates.removeAll(m_username);
-    candidates.removeDuplicates();
-    candidates.sort(Qt::CaseInsensitive);
+    const QStringList candidates = m_state.onlineUsersForDisplay();
 
     QDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("New private dialog"));
@@ -121,7 +119,7 @@ void ChatWindow::createPrivateDialog()
     auto* formLayout = new QFormLayout();
     auto* onlineUsersBox = new QComboBox(&dialog);
     onlineUsersBox->addItem(QString());
-    for (const QString& candidate : candidates) {
+    for (auto& candidate : candidates) {
         onlineUsersBox->addItem(candidate);
     }
     onlineUsersBox->setEnabled(!candidates.isEmpty());
@@ -155,7 +153,7 @@ void ChatWindow::createPrivateDialog()
         return;
     }
 
-    if (username == m_username) {
+    if (username == m_state.username()) {
         QMessageBox::warning(this,
                              QStringLiteral("New private dialog"),
                              QStringLiteral("You cannot create a dialog with yourself."));
@@ -168,14 +166,15 @@ void ChatWindow::createPrivateDialog()
         return;
     }
 
-    ensurePrivateDialog(username);
+    m_state.ensurePrivateDialog(username);
     rebuildDialogList(username);
     requestCurrentHistory();
     setStatusText(QStringLiteral("Dialog with %1 selected").arg(username));
 }
+
 void ChatWindow::sendMessage()
 {
-    if (!m_onlineSession || m_offlineMode || m_username.isEmpty()) {
+    if (!m_onlineSession || m_offlineMode || m_state.username().isEmpty()) {
         return;
     }
 
@@ -184,8 +183,13 @@ void ChatWindow::sendMessage()
         return;
     }
 
+    if (!AuthProtocol::isMessageTextValid(text)) {
+        setStatusText(QStringLiteral("Message must be 1-%1 characters").arg(AuthProtocol::kMaxMessageLength));
+        return;
+    }
+
     ChatMessage message;
-    message.author = m_username;
+    message.author = m_state.username();
     message.text = text;
     message.status = QStringLiteral("sending");
     message.chatKey = currentChatKey();
@@ -204,24 +208,22 @@ void ChatWindow::sendMessage()
 
 void ChatWindow::onUsersUpdated(const QStringList& users)
 {
-    m_onlineUsers = users;
+    m_state.setOnlineUsers(users);
     rebuildOnlineUsersList();
 }
 
 void ChatWindow::onDialogsReceived(const QStringList& dialogs)
 {
     const QString selectedChat = currentChatKey();
-    for (const QString& dialog : dialogs) {
-        ensurePrivateDialog(dialog);
-    }
+    m_state.mergeDialogs(dialogs);
     rebuildDialogList(selectedChat);
 }
 
 void ChatWindow::onHistoryReceived(const QString& chatUser, const QJsonArray& items)
 {
-    ensurePrivateDialog(chatUser);
+    m_state.ensurePrivateDialog(chatUser);
 
-    for (const QJsonValue& value : items) {
+    for (auto& value : items) {
         const QJsonObject object = value.toObject();
         ChatMessage message;
         message.id = object.value("id").toString();
@@ -229,7 +231,7 @@ void ChatWindow::onHistoryReceived(const QString& chatUser, const QJsonArray& it
         message.author = object.value("from").toString();
         message.text = object.value("text").toString();
         message.status = object.value("status").toString(QStringLiteral("delivered"));
-        message.outgoing = message.author == m_username;
+        message.outgoing = message.author == m_state.username();
         message.createdAt = object.value("created_at").toVariant().toLongLong();
         appendMessage(message);
     }
@@ -247,7 +249,7 @@ void ChatWindow::onUserLookupFinished(const QString& username, bool exists, bool
         return;
     }
 
-    ensurePrivateDialog(username);
+    m_state.ensurePrivateDialog(username);
     rebuildDialogList(username);
     requestCurrentHistory();
     setStatusText(online ? QStringLiteral("Dialog with %1 created").arg(username)
@@ -262,7 +264,7 @@ void ChatWindow::onPublicMessage(const QString& id, const QString& from, const Q
         from,
         text,
         QStringLiteral("delivered"),
-        from == m_username,
+        from == m_state.username(),
         createdAt
     });
 }
@@ -270,7 +272,7 @@ void ChatWindow::onPublicMessage(const QString& id, const QString& from, const Q
 void ChatWindow::onPrivateMessage(const QString& id, const QString& from, const QString& text, qint64 createdAt)
 {
     const QString selectedChat = currentChatKey();
-    ensurePrivateDialog(from);
+    m_state.ensurePrivateDialog(from);
     appendMessage({
         id,
         from,
@@ -290,31 +292,26 @@ void ChatWindow::onPrivateMessage(const QString& id, const QString& from, const 
 
 void ChatWindow::onMessageDelivered(const QString& id, qint64 createdAt)
 {
-    if (!m_messagesById.contains(id)) {
+    ChatMessage message;
+    if (!m_state.updateMessageStatus(id, QStringLiteral("delivered"), createdAt, &message)) {
         return;
     }
 
-    ChatMessage& message = m_messagesById[id];
-    message.status = QStringLiteral("delivered");
-    if (createdAt > 0) {
-        message.createdAt = createdAt;
-    }
-    if (!m_username.isEmpty()) {
-        m_historyStore->saveMessage(m_username, message);
+    if (!m_state.username().isEmpty()) {
+        m_historyStore->saveMessage(m_state.username(), message);
     }
     refreshCurrentChat();
 }
 
 void ChatWindow::onMessageRead(const QString& id, const QString&)
 {
-    if (!m_messagesById.contains(id)) {
+    ChatMessage message;
+    if (!m_state.updateMessageStatus(id, QStringLiteral("read"), 0, &message)) {
         return;
     }
 
-    ChatMessage& message = m_messagesById[id];
-    message.status = QStringLiteral("read");
-    if (!m_username.isEmpty()) {
-        m_historyStore->saveMessage(m_username, message);
+    if (!m_state.username().isEmpty()) {
+        m_historyStore->saveMessage(m_state.username(), message);
     }
     refreshCurrentChat();
 }
@@ -335,9 +332,8 @@ void ChatWindow::refreshCurrentChat()
     QStringList lines;
     const QDate today = QDate::currentDate();
 
-    const QStringList ids = m_chatMessages.value(chatKey);
-    for (const QString& id : ids) {
-        const ChatMessage& message = m_messagesById[id];
+    const QList<ChatMessage> messages = m_state.messagesForChat(chatKey);
+    for (auto message : messages) {
         const QDateTime timestamp = QDateTime::fromMSecsSinceEpoch(message.createdAt);
         const QString timeText = timestamp.date() == today
                                      ? timestamp.toString(QStringLiteral("HH:mm:ss"))
@@ -358,8 +354,11 @@ void ChatWindow::buildUi()
 
     auto* headerLayout = new QHBoxLayout();
     m_statusLabel = new QLabel(QStringLiteral("Ready"), this);
+    m_statusLabel->setObjectName(QStringLiteral("chatStatusLabel"));
     m_changeServerButton = new QPushButton(QStringLiteral("Change server"), this);
+    m_changeServerButton->setObjectName(QStringLiteral("chatChangeServerButton"));
     m_logoutButton = new QPushButton(QStringLiteral("Logout"), this);
+    m_logoutButton->setObjectName(QStringLiteral("chatLogoutButton"));
     headerLayout->addWidget(m_statusLabel, 1);
     headerLayout->addWidget(m_changeServerButton);
     headerLayout->addWidget(m_logoutButton);
@@ -369,9 +368,12 @@ void ChatWindow::buildUi()
     auto* sidebarLayout = new QVBoxLayout();
     auto* dialogsLabel = new QLabel(QStringLiteral("Dialogs"), this);
     m_dialogsList = new QListWidget(this);
+    m_dialogsList->setObjectName(QStringLiteral("chatDialogsList"));
     m_newDialogButton = new QPushButton(QStringLiteral("New dialog"), this);
+    m_newDialogButton->setObjectName(QStringLiteral("chatNewDialogButton"));
     auto* onlineUsersLabel = new QLabel(QStringLiteral("Online users"), this);
     m_onlineUsersList = new QListWidget(this);
+    m_onlineUsersList->setObjectName(QStringLiteral("chatOnlineUsersList"));
     m_onlineUsersList->setSelectionMode(QAbstractItemView::NoSelection);
 
     sidebarLayout->addWidget(dialogsLabel);
@@ -382,6 +384,7 @@ void ChatWindow::buildUi()
     sidebarLayout->addWidget(m_onlineUsersList, 2);
 
     m_historyView = new QTextEdit(this);
+    m_historyView->setObjectName(QStringLiteral("chatHistoryView"));
     m_historyView->setReadOnly(true);
     contentLayout->addLayout(sidebarLayout, 1);
     contentLayout->addWidget(m_historyView, 3);
@@ -389,7 +392,9 @@ void ChatWindow::buildUi()
 
     auto* composerLayout = new QHBoxLayout();
     m_messageEdit = new QLineEdit(this);
+    m_messageEdit->setObjectName(QStringLiteral("chatMessageEdit"));
     m_sendButton = new QPushButton(QStringLiteral("Send"), this);
+    m_sendButton->setObjectName(QStringLiteral("chatSendButton"));
     composerLayout->addWidget(m_messageEdit, 1);
     composerLayout->addWidget(m_sendButton);
     rootLayout->addLayout(composerLayout);
@@ -412,18 +417,16 @@ void ChatWindow::loadLocalHistory(const QString& username)
     }
 
     const QStringList dialogs = m_historyStore->loadDialogs(username);
-    for (const QString& dialog : dialogs) {
-        ensurePrivateDialog(dialog);
-    }
+    m_state.mergeDialogs(dialogs);
 
     const QList<ChatMessage> broadcastMessages = m_historyStore->loadMessages(username, QStringLiteral("Broadcast"));
-    for (const ChatMessage& message : broadcastMessages) {
+    for (auto message : broadcastMessages) {
         appendMessage(message, false);
     }
 
-    for (const QString& dialog : dialogs) {
+    for (auto dialog : dialogs) {
         const QList<ChatMessage> messages = m_historyStore->loadMessages(username, dialog);
-        for (const ChatMessage& message : messages) {
+        for (auto message : messages) {
             appendMessage(message, false);
         }
     }
@@ -434,41 +437,10 @@ void ChatWindow::loadLocalHistory(const QString& username)
 
 void ChatWindow::appendMessage(const ChatMessage& sourceMessage, bool persist)
 {
-    ChatMessage message = sourceMessage;
-    if (message.createdAt <= 0) {
-        message.createdAt = QDateTime::currentMSecsSinceEpoch();
-    }
+    const ChatMessage message = m_state.upsertMessage(sourceMessage);
 
-    if (m_messagesById.contains(message.id)) {
-        ChatMessage& existing = m_messagesById[message.id];
-        if (!message.chatKey.isEmpty()) {
-            existing.chatKey = message.chatKey;
-        }
-        existing.author = message.author;
-        existing.text = message.text;
-        existing.status = message.status;
-        existing.outgoing = message.outgoing;
-        existing.createdAt = message.createdAt;
-        message = existing;
-    } else {
-        m_messagesById.insert(message.id, message);
-    }
-
-    QStringList& ids = m_chatMessages[message.chatKey];
-    if (!ids.contains(message.id)) {
-        ids.append(message.id);
-        std::stable_sort(ids.begin(), ids.end(), [this](const QString& left, const QString& right) {
-            const ChatMessage& leftMessage = m_messagesById[left];
-            const ChatMessage& rightMessage = m_messagesById[right];
-            if (leftMessage.createdAt == rightMessage.createdAt) {
-                return left < right;
-            }
-            return leftMessage.createdAt < rightMessage.createdAt;
-        });
-    }
-
-    if (persist && !m_username.isEmpty()) {
-        m_historyStore->saveMessage(m_username, message);
+    if (persist && !m_state.username().isEmpty()) {
+        m_historyStore->saveMessage(m_state.username(), message);
     }
 
     refreshCurrentChat();
@@ -476,10 +448,7 @@ void ChatWindow::appendMessage(const ChatMessage& sourceMessage, bool persist)
 
 void ChatWindow::clearLoadedHistory()
 {
-    m_onlineUsers.clear();
-    m_privateDialogs.clear();
-    m_messagesById.clear();
-    m_chatMessages.clear();
+    m_state.clear();
     m_dialogsList->clear();
     m_onlineUsersList->clear();
     m_historyView->clear();
@@ -495,17 +464,6 @@ QString ChatWindow::currentChatKey() const
     return m_dialogsList->currentItem()->text();
 }
 
-void ChatWindow::ensurePrivateDialog(const QString& username)
-{
-    if (username.isEmpty() || username == m_username || username == QStringLiteral("Broadcast")) {
-        return;
-    }
-
-    if (!m_privateDialogs.contains(username)) {
-        m_privateDialogs.append(username);
-    }
-}
-
 void ChatWindow::markCurrentPrivateMessagesRead()
 {
     if (!m_onlineSession || m_offlineMode) {
@@ -517,30 +475,24 @@ void ChatWindow::markCurrentPrivateMessagesRead()
         return;
     }
 
-    const QStringList ids = m_chatMessages.value(chatKey);
-    for (const QString& id : ids) {
-        ChatMessage& message = m_messagesById[id];
-        if (!message.outgoing && message.status != QStringLiteral("read")) {
-            message.status = QStringLiteral("read");
-            if (!m_username.isEmpty()) {
-                m_historyStore->saveMessage(m_username, message);
-            }
-            m_client->sendReadReceipt(chatKey, id);
+    const QList<ChatMessage> updatedMessages = m_state.markIncomingMessagesRead(chatKey);
+    for (auto message : updatedMessages) {
+        if (!m_state.username().isEmpty()) {
+            m_historyStore->saveMessage(m_state.username(), message);
         }
+        m_client->sendReadReceipt(chatKey, message.id);
     }
 }
 
 void ChatWindow::rebuildDialogList(const QString& preferredChat)
 {
     const QString selectedChat = preferredChat.isEmpty() ? currentChatKey() : preferredChat;
-    QStringList dialogs = m_privateDialogs;
-    dialogs.sort(Qt::CaseInsensitive);
+    const QStringList dialogs = m_state.dialogList();
 
     {
         QSignalBlocker blocker(m_dialogsList);
         m_dialogsList->clear();
-        m_dialogsList->addItem(QStringLiteral("Broadcast"));
-        for (const QString& chat : dialogs) {
+        for (auto chat : dialogs) {
             m_dialogsList->addItem(chat);
         }
 
@@ -557,14 +509,11 @@ void ChatWindow::rebuildDialogList(const QString& preferredChat)
 
 void ChatWindow::rebuildOnlineUsersList()
 {
-    QStringList onlineUsers = m_onlineUsers;
-    onlineUsers.removeAll(m_username);
-    onlineUsers.removeDuplicates();
-    onlineUsers.sort(Qt::CaseInsensitive);
+    const QStringList onlineUsers = m_state.onlineUsersForDisplay();
 
     QSignalBlocker blocker(m_onlineUsersList);
     m_onlineUsersList->clear();
-    for (const QString& username : onlineUsers) {
+    for (auto username : onlineUsers) {
         m_onlineUsersList->addItem(username);
     }
 }
@@ -589,8 +538,8 @@ void ChatWindow::updateUiState()
     m_messageEdit->setEnabled(canCompose);
     m_sendButton->setEnabled(canCompose);
     m_newDialogButton->setEnabled(canCompose);
-    m_changeServerButton->setEnabled(!m_username.isEmpty());
-    m_logoutButton->setEnabled(!m_username.isEmpty());
+    m_changeServerButton->setEnabled(!m_state.username().isEmpty());
+    m_logoutButton->setEnabled(!m_state.username().isEmpty());
     m_onlineUsersList->setEnabled(canCompose);
 
     if (m_offlineMode) {
@@ -599,4 +548,8 @@ void ChatWindow::updateUiState()
         m_messageEdit->setPlaceholderText(QStringLiteral("Type a message"));
     }
 }
+
+
+
+
 

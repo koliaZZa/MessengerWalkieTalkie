@@ -1,7 +1,10 @@
 #pragma once
 
+#include <functional>
+
 #include <QObject>
 
+#include "clientflowstate.h"
 #include "historystore.h"
 
 class ChatWindow;
@@ -14,16 +17,23 @@ class ClientFlowController : public QObject
     Q_OBJECT
 
 public:
-    explicit ClientFlowController(QObject* parent = nullptr);
+    using ServerSettingsProvider = std::function<bool(QString&, quint16&)>;
+
+    explicit ClientFlowController(QObject* parent);
+    explicit ClientFlowController(const QString& historyDatabasePath = QString(),
+                                  QObject* parent = nullptr);
     ~ClientFlowController() override;
 
+    void setInitialEndpoint(const QString& host, quint16 port);
     void start();
+    void setServerSettingsProvider(ServerSettingsProvider provider);
 
 private slots:
     void onSocketConnected();
     void onSocketDisconnected();
-    void onAuthSucceeded(const QString& username);
+    void onAuthSucceeded(const QString& username, const QString& sessionToken, qint64 sessionExpiresAt);
     void onAuthFailed(const QString& message);
+    void onSessionInvalid(const QString& message);
     void onStatusChanged(const QString& message);
     void onTransportError(const QString& message);
     void onLoginRequested(const QString& username, const QString& password);
@@ -34,28 +44,23 @@ private slots:
 
 private:
     void attemptConnection(const QString& host, quint16 port);
-    void beginAutoLogin();
+    void beginSessionResume();
+    void persistStoredSessionState();
     void showConnectionWindow();
     void showLoginWindow(const QString& statusText = QString());
     void showChatWindow();
     void updateEndpointLabels();
     void updateOfflineAvailability(bool available);
-    bool hasStoredSession() const;
-    bool canAutoLogin() const;
-    void persistSuccessfulSession(const QString& username);
-    bool promptForServerSettings();
+    bool promptForServerSettings(QString& host, quint16& port);
 
     HistoryStore m_historyStore;
     NetworkClient* m_client;
     ConnectionWindow* m_connectionWindow;
     LoginWindow* m_loginWindow;
     ChatWindow* m_chatWindow;
-    LastSessionInfo m_lastSession;
-    QString m_currentHost {QStringLiteral("127.0.0.1")};
-    quint16 m_currentPort {5555};
-    QString m_pendingUsername;
-    QString m_pendingPassword;
-    bool m_autoLoginPending {false};
-    bool m_autoLoginBlocked {false};
-    bool m_offlineViewActive {false};
+    ClientFlowState m_flowState;
+    ServerSettingsProvider m_serverSettingsProvider;
+    QString m_initialHost {QStringLiteral("127.0.0.1")};
+    quint16 m_initialPort {5555};
 };
+

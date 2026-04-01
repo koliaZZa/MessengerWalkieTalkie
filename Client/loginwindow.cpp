@@ -77,11 +77,6 @@ void LoginWindow::setUsername(const QString& username)
     m_usernameEdit->setText(username);
 }
 
-void LoginWindow::setPassword(const QString& password)
-{
-    m_passwordEdit->setText(password);
-}
-
 void LoginWindow::clearPassword()
 {
     m_passwordEdit->clear();
@@ -94,4 +89,24 @@ void LoginWindow::setBusy(bool busy)
     m_loginButton->setEnabled(!busy);
     m_registerButton->setEnabled(!busy);
     m_changeServerButton->setEnabled(!busy);
+}
+
+QString LoginWindow::endpointText() const
+{
+    return m_endpointLabel->text();
+}
+
+QString LoginWindow::statusText() const
+{
+    return m_statusLabel->text();
+}
+
+QString LoginWindow::username() const
+{
+    return m_usernameEdit->text();
+}
+
+bool LoginWindow::isBusy() const
+{
+    return !m_loginButton->isEnabled();
 }

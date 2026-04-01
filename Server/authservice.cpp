@@ -1,10 +1,46 @@
 #include "authservice.h"
 
 #include <QCryptographicHash>
+#include <QDateTime>
+#include <QRandomGenerator>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QVariant>
 #include <QUuid>
+
+namespace {
+
+constexpr int kPbkdf2Iterations = 120000;
+constexpr int kPbkdf2KeyLength = 32;
+constexpr int kPasswordSaltBytes = 16;
+constexpr int kHmacBlockSize = 64;
+constexpr char kPbkdf2Prefix[] = "pbkdf2_sha256";
+
+QByteArray toBigEndian(quint32 value)
+{
+    QByteArray bytes(4, '\0');
+    bytes[0] = static_cast<char>((value >> 24) & 0xFF);
+    bytes[1] = static_cast<char>((value >> 16) & 0xFF);
+    bytes[2] = static_cast<char>((value >> 8) & 0xFF);
+    bytes[3] = static_cast<char>(value & 0xFF);
+    return bytes;
+}
+
+bool constantTimeEquals(const QByteArray& left, const QByteArray& right)
+{
+    if (left.size() != right.size()) {
+        return false;
+    }
+
+    unsigned char diff = 0;
+    for (int index = 0; index < left.size(); ++index) {
+        diff |= static_cast<unsigned char>(left.at(index) ^ right.at(index));
+    }
+
+    return diff == 0;
+}
+
+}
 
 AuthService::AuthService(QObject* parent)
     : QObject(parent)
@@ -29,24 +65,36 @@ bool AuthService::init(const QString& databasePath)
 
     m_connectionName = QStringLiteral("auth_%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
     m_database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), m_connectionName);
+    if (databasePath.startsWith(QStringLiteral("file:"), Qt::CaseInsensitive)) {
+        m_database.setConnectOptions(QStringLiteral("QSQLITE_OPEN_URI"));
+    }
     m_database.setDatabaseName(databasePath);
     if (!m_database.open()) {
+        return false;
+    }
+
+    QSqlQuery query(m_database);
+    if (!query.exec(QStringLiteral("PRAGMA foreign_keys = ON"))) {
         return false;
     }
 
     return ensureSchema();
 }
 
-bool AuthService::registerUser(const QString& username, const QString& password, QString& errorMessage)
+bool AuthService::registerUser(const QString& username,
+                               const QString& password,
+                               QString& errorMessage,
+                               AuthProtocol::SessionInfo* sessionInfo)
 {
-    const QString normalizedUsername = username.trimmed();
+    const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
     if (!isUsernameValid(normalizedUsername)) {
         errorMessage = QStringLiteral("Username must be 3-32 latin letters, digits or underscore");
         return false;
     }
 
-    if (password.size() < 4) {
-        errorMessage = QStringLiteral("Password must be at least 4 characters");
+    if (password.size() < AuthProtocol::kMinPasswordLength) {
+        errorMessage = QStringLiteral("Password must be at least %1 characters")
+                           .arg(AuthProtocol::kMinPasswordLength);
         return false;
     }
 
@@ -62,12 +110,15 @@ bool AuthService::registerUser(const QString& username, const QString& password,
         return false;
     }
 
-    return true;
+    return issueSession(normalizedUsername, errorMessage, sessionInfo);
 }
 
-bool AuthService::loginUser(const QString& username, const QString& password, QString& errorMessage) const
+bool AuthService::loginUser(const QString& username,
+                            const QString& password,
+                            QString& errorMessage,
+                            AuthProtocol::SessionInfo* sessionInfo)
 {
-    const QString normalizedUsername = username.trimmed();
+    const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral("SELECT password_hash FROM users WHERE username = ?"));
     query.addBindValue(normalizedUsername);
@@ -82,17 +133,77 @@ bool AuthService::loginUser(const QString& username, const QString& password, QS
         return false;
     }
 
-    if (query.value(0).toString() != hashPassword(password)) {
+    const QString storedHash = query.value(0).toString();
+    if (!verifyPassword(password, storedHash)) {
         errorMessage = QStringLiteral("Wrong password");
         return false;
     }
 
-    return true;
+    return issueSession(normalizedUsername, errorMessage, sessionInfo);
+}
+
+bool AuthService::resumeSession(const QString& username,
+                                const QString& sessionToken,
+                                QString& errorMessage,
+                                AuthProtocol::SessionInfo* sessionInfo)
+{
+    const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
+    if (normalizedUsername.isEmpty() || sessionToken.isEmpty()) {
+        errorMessage = QStringLiteral("Session expired. Please sign in again.");
+        return false;
+    }
+
+    if (!removeExpiredSession(normalizedUsername)) {
+        errorMessage = QStringLiteral("Database error");
+        return false;
+    }
+
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral("SELECT token_hash, expires_at FROM sessions WHERE username = ?"));
+    query.addBindValue(normalizedUsername);
+    if (!query.exec()) {
+        errorMessage = QStringLiteral("Database error");
+        return false;
+    }
+
+    if (!query.next()) {
+        errorMessage = QStringLiteral("Session expired. Please sign in again.");
+        return false;
+    }
+
+    const qint64 expiresAt = query.value(1).toLongLong();
+    if (expiresAt <= QDateTime::currentMSecsSinceEpoch()) {
+        invalidateSession(normalizedUsername);
+        errorMessage = QStringLiteral("Session expired. Please sign in again.");
+        return false;
+    }
+
+    const QByteArray actualHash = hashSessionToken(sessionToken).toUtf8();
+    const QByteArray storedHash = query.value(0).toString().toUtf8();
+    if (!constantTimeEquals(actualHash, storedHash)) {
+        errorMessage = QStringLiteral("Session invalid. Please sign in again.");
+        return false;
+    }
+
+    return issueSession(normalizedUsername, errorMessage, sessionInfo);
+}
+
+bool AuthService::invalidateSession(const QString& username)
+{
+    const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
+    if (normalizedUsername.isEmpty()) {
+        return true;
+    }
+
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral("DELETE FROM sessions WHERE username = ?"));
+    query.addBindValue(normalizedUsername);
+    return query.exec();
 }
 
 bool AuthService::userExists(const QString& username) const
 {
-    const QString normalizedUsername = username.trimmed();
+    const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
     if (normalizedUsername.isEmpty()) {
         return false;
     }
@@ -320,6 +431,13 @@ bool AuthService::ensureSchema()
             "from_user TEXT NOT NULL,"
             "text TEXT NOT NULL,"
             "created_at INTEGER NOT NULL)"),
+        QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS sessions ("
+            "username TEXT PRIMARY KEY,"
+            "token_hash TEXT NOT NULL,"
+            "expires_at INTEGER NOT NULL,"
+            "created_at INTEGER NOT NULL,"
+            "FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE)"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_from_to_time ON messages(from_user, to_user, created_at)"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_to_from_time ON messages(to_user, from_user, created_at)"),
         QStringLiteral(
@@ -327,10 +445,13 @@ bool AuthService::ensureSchema()
             "ON messages(to_user, delivered_at, created_at)"),
         QStringLiteral(
             "CREATE INDEX IF NOT EXISTS idx_broadcast_messages_created_at "
-            "ON broadcast_messages(created_at)")
+            "ON broadcast_messages(created_at)"),
+        QStringLiteral(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_expires_at "
+            "ON sessions(expires_at)")
     };
 
-    for (const QString& statement : statements) {
+    for (auto& statement : statements) {
         if (!query.exec(statement)) {
             return false;
         }
@@ -341,20 +462,166 @@ bool AuthService::ensureSchema()
 
 QString AuthService::hashPassword(const QString& password) const
 {
-    return QString::fromUtf8(QCryptographicHash::hash(password.toUtf8(), QCryptographicHash::Sha256).toHex());
+    const QByteArray salt = randomBytes(kPasswordSaltBytes);
+    const QByteArray derived = derivePbkdf2(password.toUtf8(), salt, kPbkdf2Iterations, kPbkdf2KeyLength);
+    return QStringLiteral("%1$%2$%3$%4")
+        .arg(QString::fromLatin1(kPbkdf2Prefix))
+        .arg(kPbkdf2Iterations)
+        .arg(QString::fromUtf8(salt.toHex()))
+        .arg(QString::fromUtf8(derived.toHex()));
 }
 
-bool AuthService::isUsernameValid(const QString& username) const
+bool AuthService::verifyPassword(const QString& password, const QString& storedHash) const
 {
-    if (username.size() < 3 || username.size() > 32) {
+    const QStringList parts = storedHash.split(QStringLiteral("$"));
+    if (parts.size() != 4 || parts.constFirst() != QString::fromLatin1(kPbkdf2Prefix)) {
         return false;
     }
 
-    for (const QChar character : username) {
-        if (!(character.isLetterOrNumber() || character == QChar(u'_'))) {
-            return false;
+    bool iterationsOk = false;
+    const int iterations = parts.at(1).toInt(&iterationsOk);
+    const QByteArray salt = QByteArray::fromHex(parts.at(2).toUtf8());
+    const QByteArray expected = QByteArray::fromHex(parts.at(3).toUtf8());
+    if (!iterationsOk || iterations <= 0 || salt.isEmpty() || expected.isEmpty()) {
+        return false;
+    }
+
+    const QByteArray actual = derivePbkdf2(password.toUtf8(), salt, iterations, expected.size());
+    return constantTimeEquals(actual, expected);
+}
+
+QByteArray AuthService::randomBytes(int count) const
+{
+    QByteArray bytes(count, '\0');
+    for (int index = 0; index < count; ++index) {
+        bytes[index] = static_cast<char>(QRandomGenerator::system()->generate() & 0xFF);
+    }
+    return bytes;
+}
+
+QByteArray AuthService::hmacSha256(const QByteArray& key, const QByteArray& message) const
+{
+    QByteArray normalizedKey = key;
+    if (normalizedKey.size() > kHmacBlockSize) {
+        normalizedKey = QCryptographicHash::hash(normalizedKey, QCryptographicHash::Sha256);
+    }
+
+    normalizedKey = normalizedKey.leftJustified(kHmacBlockSize, '\0', true);
+
+    QByteArray innerPad(kHmacBlockSize, '\0');
+    QByteArray outerPad(kHmacBlockSize, '\0');
+    for (int index = 0; index < kHmacBlockSize; ++index) {
+        const char keyByte = normalizedKey.at(index);
+        innerPad[index] = static_cast<char>(keyByte ^ 0x36);
+        outerPad[index] = static_cast<char>(keyByte ^ 0x5C);
+    }
+
+    QByteArray innerInput = innerPad;
+    innerInput.append(message);
+    const QByteArray innerHash = QCryptographicHash::hash(innerInput, QCryptographicHash::Sha256);
+
+    QByteArray outerInput = outerPad;
+    outerInput.append(innerHash);
+    return QCryptographicHash::hash(outerInput, QCryptographicHash::Sha256);
+}
+
+QByteArray AuthService::derivePbkdf2(const QByteArray& password,
+                                     const QByteArray& salt,
+                                     int iterations,
+                                     int keyLength) const
+{
+    QByteArray derived;
+    quint32 blockIndex = 1;
+    while (derived.size() < keyLength) {
+        QByteArray initialBlock = salt;
+        initialBlock.append(toBigEndian(blockIndex));
+
+        QByteArray value = hmacSha256(password, initialBlock);
+        QByteArray block = value;
+        for (int round = 1; round < iterations; ++round) {
+            value = hmacSha256(password, value);
+            for (int byteIndex = 0; byteIndex < block.size(); ++byteIndex) {
+                block[byteIndex] = static_cast<char>(block.at(byteIndex) ^ value.at(byteIndex));
+            }
         }
+
+        derived.append(block);
+        ++blockIndex;
+    }
+
+    derived.truncate(keyLength);
+    return derived;
+}
+
+QString AuthService::generateSessionToken() const
+{
+    return QString::fromUtf8(randomBytes(AuthProtocol::kSessionTokenBytes).toHex());
+}
+
+QString AuthService::hashSessionToken(const QString& sessionToken) const
+{
+    return QString::fromUtf8(QCryptographicHash::hash(sessionToken.toUtf8(), QCryptographicHash::Sha256).toHex());
+}
+
+bool AuthService::issueSession(const QString& username,
+                               QString& errorMessage,
+                               AuthProtocol::SessionInfo* sessionInfo)
+{
+    const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
+    if (normalizedUsername.isEmpty()) {
+        errorMessage = QStringLiteral("User not found");
+        return false;
+    }
+
+    const QString sessionToken = generateSessionToken();
+    const qint64 createdAt = QDateTime::currentMSecsSinceEpoch();
+    const qint64 expiresAt = createdAt + AuthProtocol::kSessionLifetimeMs;
+
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral(
+        "INSERT OR REPLACE INTO sessions(username, token_hash, expires_at, created_at) "
+        "VALUES(?, ?, ?, ?)"));
+    query.addBindValue(normalizedUsername);
+    query.addBindValue(hashSessionToken(sessionToken));
+    query.addBindValue(expiresAt);
+    query.addBindValue(createdAt);
+    if (!query.exec()) {
+        errorMessage = QStringLiteral("Database error");
+        return false;
+    }
+
+    if (sessionInfo) {
+        sessionInfo->token = sessionToken;
+        sessionInfo->expiresAt = expiresAt;
     }
 
     return true;
 }
+
+bool AuthService::removeExpiredSession(const QString& username)
+{
+    const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
+    if (normalizedUsername.isEmpty()) {
+        return true;
+    }
+
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral(
+        "DELETE FROM sessions WHERE username = ? AND expires_at <= ?"));
+    query.addBindValue(normalizedUsername);
+    query.addBindValue(QDateTime::currentMSecsSinceEpoch());
+    return query.exec();
+}
+
+bool AuthService::isUsernameValid(const QString& username) const
+{
+    return AuthProtocol::isAsciiUsernameValid(AuthProtocol::normalizeUsername(username));
+}
+
+
+
+
+
+
+
+

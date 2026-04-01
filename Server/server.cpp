@@ -1,8 +1,9 @@
-﻿#include "server.h"
+#include "server.h"
 
 #include "connection.h"
 #include "logger.h"
 #include "worker.h"
+#include "../Shared/authprotocol.h"
 
 #include <QCoreApplication>
 #include <QDateTime>
@@ -12,6 +13,24 @@
 #include <QTcpSocket>
 #include <QThread>
 #include <algorithm>
+
+namespace {
+
+constexpr char kTypeCheckUser[] = "check_user";
+constexpr char kTypeDialogs[] = "dialogs";
+constexpr char kTypeHistory[] = "history";
+constexpr char kTypeMessage[] = "message";
+constexpr char kTypePrivate[] = "private";
+constexpr char kTypeRead[] = "read";
+
+const RateLimiter::Rule kRegisterRateLimit{4, 60 * 1000};
+const RateLimiter::Rule kLoginRateLimit{6, 60 * 1000};
+const RateLimiter::Rule kResumeSessionRateLimit{20, 60 * 1000};
+const RateLimiter::Rule kCheckUserRateLimit{20, 10 * 1000};
+const RateLimiter::Rule kMessageRateLimit{25, 10 * 1000};
+const RateLimiter::Rule kReadReceiptRateLimit{60, 10 * 1000};
+
+}  // namespace
 
 Server::Server(QObject* parent)
     : QObject(parent)
@@ -28,7 +47,7 @@ bool Server::start(quint16 port)
 {
     Logger::instance().start();
 
-    if (!m_authService.init()) {
+    if (!m_authService.init(m_databasePath)) {
         Logger::instance().log(LogLevel::Error, QStringLiteral("Failed to initialize auth storage"));
         return false;
     }
@@ -42,7 +61,7 @@ bool Server::start(quint16 port)
     const int workerCount = qMax(2, QThread::idealThreadCount());
     for (int i = 0; i < workerCount; ++i) {
         auto* worker = new Worker();
-        connect(worker, &Worker::connectionReady, this, &Server::onConnectionReady, Qt::QueuedConnection);
+        connect(worker, &Worker::connectionReady, this, &Server::onConnectionReady, Qt::BlockingQueuedConnection);
         m_workers.append(worker);
     }
 
@@ -53,6 +72,22 @@ bool Server::start(quint16 port)
     }
 
     return ok;
+}
+
+void Server::setDatabasePath(const QString& databasePath)
+{
+    if (m_tcpServer.isListening()) {
+        return;
+    }
+
+    m_databasePath = databasePath.trimmed().isEmpty()
+                         ? QStringLiteral("users.db")
+                         : databasePath.trimmed();
+}
+
+quint16 Server::listeningPort() const
+{
+    return m_tcpServer.serverPort();
 }
 
 void Server::stop()
@@ -76,7 +111,7 @@ void Server::stop()
     }
 
     QThread* ownerThread = QThread::currentThread();
-    for (Worker* worker : workers) {
+    for (auto worker : workers) {
         worker->shutdown(ownerThread);
         delete worker;
     }
@@ -112,222 +147,576 @@ void Server::onConnectionReady(Connection* connection)
     connect(connection, &Connection::closed, this, &Server::onConnectionClosed, Qt::QueuedConnection);
 }
 
-void Server::onPacketReceived(Connection* connection, const QJsonObject& packet)
+void Server::sendAuthError(Connection* connection, const QString& errorMessage)
 {
-    const QString type = packet.value("type").toString();
-    auto loginConnection = [this, connection](const QString& username, QString& errorMessage) {
-        QMutexLocker locker(&m_mutex);
+    sendTo(connection,
+           {
+               {AuthProtocol::kFieldType, QString::fromLatin1(AuthProtocol::kTypeAuthError)},
+               {AuthProtocol::kFieldMessage, errorMessage}
+           });
+}
 
-        const QString currentUsername = m_connectionUsers.value(connection);
-        if (!currentUsername.isEmpty() && currentUsername != username) {
-            m_onlineUsers.remove(currentUsername);
-            m_connectionUsers.remove(connection);
-        }
+bool Server::canStartAuthenticatedSession(Connection* connection,
+                                          const QString& username,
+                                          QString& errorMessage) const
+{
+    QMutexLocker locker(&m_mutex);
 
-        if (m_onlineUsers.contains(username) && m_onlineUsers.value(username) != connection) {
-            errorMessage = QStringLiteral("User already logged in");
-            return false;
-        }
-
-        m_onlineUsers.insert(username, connection);
-        m_connectionUsers.insert(connection, username);
+    const QString currentUsername = m_connectionUsers.value(connection);
+    if (!currentUsername.isEmpty() && currentUsername == username) {
         return true;
-    };
+    }
 
-    if (type == "register") {
-        const QString username = packet.value("username").toString().trimmed();
-        QString errorMessage;
-        const bool ok = m_authService.registerUser(username,
-                                                   packet.value("password").toString(),
-                                                   errorMessage);
+    if (m_onlineUsers.contains(username) && m_onlineUsers.value(username) != connection) {
+        errorMessage = QStringLiteral("User already logged in");
+        return false;
+    }
 
-        if (!ok) {
-            sendTo(connection, {{"type", "auth_error"}, {"message", errorMessage}});
-            return;
-        }
+    return true;
+}
 
-        if (!loginConnection(username, errorMessage)) {
-            sendTo(connection, {{"type", "auth_error"}, {"message", errorMessage}});
-            return;
-        }
+bool Server::attachAuthenticatedSession(Connection* connection,
+                                        const QString& username,
+                                        QString& errorMessage)
+{
+    QMutexLocker locker(&m_mutex);
 
-        sendTo(connection, {{"type", "auth_ok"}, {"username", username}});
-        broadcastUsers();
-        sendDialogList(connection, username);
-        sendPendingPrivateMessages(connection, username);
+    const QString currentUsername = m_connectionUsers.value(connection);
+    if (!currentUsername.isEmpty() && currentUsername != username) {
+        m_onlineUsers.remove(currentUsername);
+        m_connectionUsers.remove(connection);
+        m_authService.invalidateSession(currentUsername);
+    }
+
+    if (m_onlineUsers.contains(username) && m_onlineUsers.value(username) != connection) {
+        errorMessage = QStringLiteral("User already logged in");
+        return false;
+    }
+
+    m_onlineUsers.insert(username, connection);
+    m_connectionUsers.insert(connection, username);
+    return true;
+}
+
+void Server::finalizeAuthenticatedSession(Connection* connection,
+                                          const QString& username,
+                                          const AuthProtocol::SessionInfo& sessionInfo)
+{
+    sendTo(connection, AuthProtocol::makeAuthOkPacket(username, sessionInfo));
+    broadcastUsers();
+    sendDialogList(connection, username);
+    sendPendingPrivateMessages(connection, username);
+}
+
+bool Server::handleAuthPacket(Connection* connection, const QString& type, const QJsonObject& packet)
+{
+    if (type == QString::fromLatin1(AuthProtocol::kTypeRegister)) {
+        handleRegisterPacket(connection, packet);
+        return true;
+    }
+
+    if (type == QString::fromLatin1(AuthProtocol::kTypeLogin)) {
+        handleLoginPacket(connection, packet);
+        return true;
+    }
+
+    if (type == QString::fromLatin1(AuthProtocol::kTypeResumeSession)) {
+        handleResumeSessionPacket(connection, packet);
+        return true;
+    }
+
+    return false;
+}
+
+bool Server::handleAuthenticatedPacket(Connection* connection,
+                                       const QString& username,
+                                       const QString& type,
+                                       const QJsonObject& packet)
+{
+    if (type == QString::fromLatin1(AuthProtocol::kTypeLogout)) {
+        handleLogoutPacket(connection, username);
+        return true;
+    }
+
+    if (type == QString::fromLatin1(kTypeCheckUser)) {
+        handleCheckUserPacket(connection, username, packet);
+        return true;
+    }
+
+    if (type == QString::fromLatin1(kTypeDialogs)) {
+        handleDialogsPacket(connection, username);
+        return true;
+    }
+
+    if (type == QString::fromLatin1(kTypeHistory)) {
+        handleHistoryPacket(connection, username, packet);
+        return true;
+    }
+
+    if (type == QString::fromLatin1(kTypeMessage)) {
+        handleBroadcastPacket(connection, username, packet);
+        return true;
+    }
+
+    if (type == QString::fromLatin1(kTypePrivate)) {
+        handlePrivatePacket(connection, username, packet);
+        return true;
+    }
+
+    if (type == QString::fromLatin1(kTypeRead)) {
+        handleReadPacket(connection, username, packet);
+        return true;
+    }
+
+    return false;
+}
+
+void Server::handleRegisterPacket(Connection* connection, const QJsonObject& packet)
+{
+    const QString username = AuthProtocol::normalizeUsername(packet.value(AuthProtocol::kFieldUsername).toString());
+    QString errorMessage;
+    if (!allowPeerAction(connection,
+                         QStringLiteral("register"),
+                         kRegisterRateLimit,
+                         QStringLiteral("Too many registration attempts."),
+                         errorMessage)) {
+        sendAuthError(connection, errorMessage);
         return;
     }
 
-    if (type == "login") {
-        const QString username = packet.value("username").toString().trimmed();
-        QString errorMessage;
-
-        if (!m_authService.loginUser(username, packet.value("password").toString(), errorMessage)) {
-            sendTo(connection, {{"type", "auth_error"}, {"message", errorMessage}});
-            return;
-        }
-
-        if (!loginConnection(username, errorMessage)) {
-            sendTo(connection, {{"type", "auth_error"}, {"message", errorMessage}});
-            return;
-        }
-
-        sendTo(connection, {{"type", "auth_ok"}, {"username", username}});
-        broadcastUsers();
-        sendDialogList(connection, username);
-        sendPendingPrivateMessages(connection, username);
+    if (!canStartAuthenticatedSession(connection, username, errorMessage)) {
+        sendAuthError(connection, errorMessage);
         return;
     }
 
-    if (type == "check_user") {
-        const QString username = packet.value("username").toString().trimmed();
-        bool online = false;
+    AuthProtocol::SessionInfo sessionInfo;
+    if (!m_authService.registerUser(username,
+                                    packet.value(AuthProtocol::kFieldPassword).toString(),
+                                    errorMessage,
+                                    &sessionInfo)) {
+        sendAuthError(connection, errorMessage);
+        return;
+    }
 
-        {
-            QMutexLocker locker(&m_mutex);
-            online = m_onlineUsers.contains(username);
-        }
+    if (!attachAuthenticatedSession(connection, username, errorMessage)) {
+        m_authService.invalidateSession(username);
+        sendAuthError(connection, errorMessage);
+        return;
+    }
 
+    finalizeAuthenticatedSession(connection, username, sessionInfo);
+}
+
+void Server::handleLoginPacket(Connection* connection, const QJsonObject& packet)
+{
+    const QString username = AuthProtocol::normalizeUsername(packet.value(AuthProtocol::kFieldUsername).toString());
+    QString errorMessage;
+    if (!allowPeerAction(connection,
+                         QStringLiteral("login"),
+                         kLoginRateLimit,
+                         QStringLiteral("Too many login attempts."),
+                         errorMessage)) {
+        sendAuthError(connection, errorMessage);
+        return;
+    }
+
+    if (!canStartAuthenticatedSession(connection, username, errorMessage)) {
+        sendAuthError(connection, errorMessage);
+        return;
+    }
+
+    AuthProtocol::SessionInfo sessionInfo;
+    if (!m_authService.loginUser(username,
+                                 packet.value(AuthProtocol::kFieldPassword).toString(),
+                                 errorMessage,
+                                 &sessionInfo)) {
+        sendAuthError(connection, errorMessage);
+        return;
+    }
+
+    if (!attachAuthenticatedSession(connection, username, errorMessage)) {
+        m_authService.invalidateSession(username);
+        sendAuthError(connection, errorMessage);
+        return;
+    }
+
+    finalizeAuthenticatedSession(connection, username, sessionInfo);
+}
+
+void Server::handleResumeSessionPacket(Connection* connection, const QJsonObject& packet)
+{
+    const QString username = AuthProtocol::normalizeUsername(packet.value(AuthProtocol::kFieldUsername).toString());
+    const QString sessionToken = packet.value(AuthProtocol::kFieldSessionToken).toString();
+    QString errorMessage;
+    if (!allowPeerAction(connection,
+                         QStringLiteral("resume_session"),
+                         kResumeSessionRateLimit,
+                         QStringLiteral("Too many session restore attempts."),
+                         errorMessage)) {
+        sendTo(connection, AuthProtocol::makeSessionInvalidPacket(errorMessage));
+        return;
+    }
+
+    if (!canStartAuthenticatedSession(connection, username, errorMessage)) {
+        sendAuthError(connection, errorMessage);
+        return;
+    }
+
+    AuthProtocol::SessionInfo sessionInfo;
+    if (!m_authService.resumeSession(username, sessionToken, errorMessage, &sessionInfo)) {
+        sendTo(connection, AuthProtocol::makeSessionInvalidPacket(errorMessage));
+        return;
+    }
+
+    if (!attachAuthenticatedSession(connection, username, errorMessage)) {
+        m_authService.invalidateSession(username);
+        sendAuthError(connection, errorMessage);
+        return;
+    }
+
+    finalizeAuthenticatedSession(connection, username, sessionInfo);
+}
+
+void Server::handleLogoutPacket(Connection* connection, const QString& username)
+{
+    m_authService.invalidateSession(username);
+    unregisterConnection(connection);
+    broadcastUsers();
+    QMetaObject::invokeMethod(connection,
+                              [connection]() {
+                                  connection->closeConnection();
+                                  connection->deleteLater();
+                              },
+                              Qt::QueuedConnection);
+}
+
+void Server::handleCheckUserPacket(Connection* connection, const QString& username, const QJsonObject& packet)
+{
+    QString errorMessage;
+    if (!allowUserAction(connection,
+                         username,
+                         QStringLiteral("check_user"),
+                         kCheckUserRateLimit,
+                         QStringLiteral("Too many user lookup requests."),
+                         errorMessage)) {
         sendTo(connection,
                {
-                   {"type", "user_check_result"},
-                   {"username", username},
-                   {"exists", m_authService.userExists(username)},
-                   {"online", online}
+                   {"type", "error"},
+                   {"message", errorMessage}
                });
         return;
     }
 
-    const QString from = usernameFor(connection);
-    if (from.isEmpty()) {
-        sendTo(connection, {{"type", "auth_error"}, {"message", "Please login first"}});
-        return;
+    const QString lookupUsername = AuthProtocol::normalizeUsername(packet.value("username").toString());
+    bool online = false;
+
+    {
+        QMutexLocker locker(&m_mutex);
+        online = m_onlineUsers.contains(lookupUsername);
     }
 
-    if (type == "dialogs") {
-        sendDialogList(connection, from);
-        return;
-    }
+    sendTo(connection,
+           {
+               {"type", "user_check_result"},
+               {"username", lookupUsername},
+               {"exists", m_authService.userExists(lookupUsername)},
+               {"online", online}
+           });
+}
 
-    if (type == "history") {
-        const QString otherUsername = packet.value("with").toString().trimmed();
-        const int limit = qBound(1, packet.value("limit").toInt(100), 200);
-        sendHistory(connection, from, otherUsername, limit);
-        return;
-    }
+void Server::handleDialogsPacket(Connection* connection, const QString& username)
+{
+    sendDialogList(connection, username);
+}
 
-    if (type == "message") {
-        const QString messageId = packet.value("id").toString();
-        const qint64 createdAt = QDateTime::currentMSecsSinceEpoch();
-        if (!m_authService.storeBroadcastMessage(messageId, from, packet.value("text").toString(), createdAt)) {
-            sendTo(connection,
-                   {
-                       {"type", "error"},
-                       {"message", "Database error"},
-                       {"id", messageId}
-                   });
-            return;
-        }
+void Server::handleHistoryPacket(Connection* connection,
+                                 const QString& username,
+                                 const QJsonObject& packet)
+{
+    const QString otherUsername = packet.value("with").toString().trimmed();
+    const int limit = qBound(1, packet.value("limit").toInt(100), 200);
+    sendHistory(connection, username, otherUsername, limit);
+}
 
-        QList<Connection*> recipients;
-        {
-            QMutexLocker locker(&m_mutex);
-            recipients = m_onlineUsers.values();
-        }
-
-        for (auto* recipient : recipients) {
-            sendTo(recipient,
-                   {
-                       {"type", "message"},
-                       {"id", messageId},
-                       {"from", from},
-                       {"text", packet.value("text").toString()},
-                       {"created_at", createdAt}
-                   },
-                   true);
-        }
-        return;
-    }
-
-    if (type == "private") {
-        const QString toUsername = packet.value("to").toString().trimmed();
-        const QString messageId = packet.value("id").toString();
-        const QString text = packet.value("text").toString();
-        const qint64 createdAt = QDateTime::currentMSecsSinceEpoch();
-
-        if (!m_authService.userExists(toUsername)) {
-            sendTo(connection,
-                   {
-                       {"type", "error"},
-                       {"message", QStringLiteral("User not found")},
-                       {"id", messageId}
-                   });
-            return;
-        }
-
-        if (!m_authService.storePrivateMessage(messageId, from, toUsername, text, createdAt)) {
-            sendTo(connection,
-                   {
-                       {"type", "error"},
-                       {"message", "Database error"},
-                       {"id", messageId}
-                   });
-            return;
-        }
-
-        Connection* target = nullptr;
-
-        {
-            QMutexLocker locker(&m_mutex);
-            target = m_onlineUsers.value(toUsername, nullptr);
-        }
-
-        if (!target) {
-            sendTo(connection,
-                   {
-                       {"type", "queued"},
-                       {"id", messageId},
-                       {"to", toUsername},
-                       {"created_at", createdAt}
-                   });
-            return;
-        }
-
-        sendTo(target,
+void Server::handleBroadcastPacket(Connection* connection,
+                                   const QString& username,
+                                   const QJsonObject& packet)
+{
+    const QString messageId = packet.value("id").toString();
+    QString errorMessage;
+    if (!allowUserAction(connection,
+                         username,
+                         QStringLiteral("message"),
+                         kMessageRateLimit,
+                         QStringLiteral("Too many messages."),
+                         errorMessage)) {
+        sendTo(connection,
                {
-                   {"type", "private"},
+                   {"type", "error"},
+                   {"message", errorMessage},
+                   {"id", messageId}
+               });
+        return;
+    }
+
+    const QString text = packet.value("text").toString();
+    if (!AuthProtocol::isMessageTextValid(text)) {
+        sendTo(connection,
+               {
+                   {"type", "error"},
+                   {"message", QStringLiteral("Message must be 1-%1 characters").arg(AuthProtocol::kMaxMessageLength)},
+                   {"id", messageId}
+               });
+        return;
+    }
+
+    const qint64 createdAt = QDateTime::currentMSecsSinceEpoch();
+    if (!m_authService.storeBroadcastMessage(messageId, username, text, createdAt)) {
+        sendTo(connection,
+               {
+                   {"type", "error"},
+                   {"message", "Database error"},
+                   {"id", messageId}
+               });
+        return;
+    }
+
+    QList<Connection*> recipients;
+    {
+        QMutexLocker locker(&m_mutex);
+        recipients = m_onlineUsers.values();
+    }
+
+    for (auto recipient : recipients) {
+        sendTo(recipient,
+               {
+                   {"type", "message"},
                    {"id", messageId},
-                   {"from", from},
-                   {"to", toUsername},
+                   {"from", username},
                    {"text", text},
                    {"created_at", createdAt}
                },
                true);
+    }
+}
+
+void Server::handlePrivatePacket(Connection* connection,
+                                 const QString& username,
+                                 const QJsonObject& packet)
+{
+    const QString toUsername = AuthProtocol::normalizeUsername(packet.value("to").toString());
+    const QString messageId = packet.value("id").toString();
+    const QString text = packet.value("text").toString();
+    const qint64 createdAt = QDateTime::currentMSecsSinceEpoch();
+    QString errorMessage;
+
+    if (!allowUserAction(connection,
+                         username,
+                         QStringLiteral("private"),
+                         kMessageRateLimit,
+                         QStringLiteral("Too many messages."),
+                         errorMessage)) {
+        sendTo(connection,
+               {
+                   {"type", "error"},
+                   {"message", errorMessage},
+                   {"id", messageId}
+               });
         return;
     }
 
-    if (type == "read") {
-        Connection* target = nullptr;
-        const QString toUsername = packet.value("to").toString().trimmed();
-        const QString messageId = packet.value("id").toString();
-        const qint64 readAt = QDateTime::currentMSecsSinceEpoch();
-
-        m_authService.markMessageRead(messageId, readAt);
-
-        {
-            QMutexLocker locker(&m_mutex);
-            target = m_onlineUsers.value(toUsername, nullptr);
-        }
-
-        if (target) {
-            sendTo(target,
-                   {
-                       {"type", "read"},
-                       {"id", messageId},
-                       {"from", from}
-                   });
-        }
+    if (!AuthProtocol::isPrivateRecipientValid(username, toUsername)) {
+        sendTo(connection,
+               {
+                   {"type", "error"},
+                   {"message", QStringLiteral("You cannot send private messages to yourself")},
+                   {"id", messageId}
+               });
+        return;
     }
+
+    if (!AuthProtocol::isMessageTextValid(text)) {
+        sendTo(connection,
+               {
+                   {"type", "error"},
+                   {"message", QStringLiteral("Message must be 1-%1 characters").arg(AuthProtocol::kMaxMessageLength)},
+                   {"id", messageId}
+               });
+        return;
+    }
+
+    if (!m_authService.userExists(toUsername)) {
+        sendTo(connection,
+               {
+                   {"type", "error"},
+                   {"message", QStringLiteral("User not found")},
+                   {"id", messageId}
+               });
+        return;
+    }
+
+    if (!m_authService.storePrivateMessage(messageId, username, toUsername, text, createdAt)) {
+        sendTo(connection,
+               {
+                   {"type", "error"},
+                   {"message", "Database error"},
+                   {"id", messageId}
+               });
+        return;
+    }
+
+    Connection* target = nullptr;
+    {
+        QMutexLocker locker(&m_mutex);
+        target = m_onlineUsers.value(toUsername, nullptr);
+    }
+
+    if (!target) {
+        sendTo(connection,
+               {
+                   {"type", "queued"},
+                   {"id", messageId},
+                   {"to", toUsername},
+                   {"created_at", createdAt}
+               });
+        return;
+    }
+
+    sendTo(target,
+           {
+               {"type", "private"},
+               {"id", messageId},
+               {"from", username},
+               {"to", toUsername},
+               {"text", text},
+               {"created_at", createdAt}
+           },
+           true);
+}
+
+void Server::handleReadPacket(Connection* connection, const QString& username, const QJsonObject& packet)
+{
+    Connection* target = nullptr;
+    const QString toUsername = AuthProtocol::normalizeUsername(packet.value("to").toString());
+    const QString messageId = packet.value("id").toString();
+    const qint64 readAt = QDateTime::currentMSecsSinceEpoch();
+    QString errorMessage;
+
+    if (!allowUserAction(connection,
+                         username,
+                         QStringLiteral("read"),
+                         kReadReceiptRateLimit,
+                         QStringLiteral("Too many read receipts."),
+                         errorMessage)) {
+        return;
+    }
+
+    m_authService.markMessageRead(messageId, readAt);
+
+    {
+        QMutexLocker locker(&m_mutex);
+        target = m_onlineUsers.value(toUsername, nullptr);
+    }
+
+    if (target) {
+        sendTo(target,
+               {
+                   {"type", "read"},
+                   {"id", messageId},
+                   {"from", username}
+               });
+    }
+}
+
+bool Server::allowPeerAction(Connection* connection,
+                             const QString& actionName,
+                             const RateLimiter::Rule& rule,
+                             const QString& errorPrefix,
+                             QString& errorMessage)
+{
+    return allowRateLimitedAction(connection,
+                                  rateLimitPeerKey(connection),
+                                  actionName,
+                                  rule,
+                                  errorPrefix,
+                                  errorMessage);
+}
+
+bool Server::allowUserAction(Connection* connection,
+                             const QString& username,
+                             const QString& actionName,
+                             const RateLimiter::Rule& rule,
+                             const QString& errorPrefix,
+                             QString& errorMessage)
+{
+    const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
+    const QString subjectKey = normalizedUsername.isEmpty()
+                                   ? rateLimitPeerKey(connection)
+                                   : normalizedUsername;
+    return allowRateLimitedAction(connection,
+                                  subjectKey,
+                                  actionName,
+                                  rule,
+                                  errorPrefix,
+                                  errorMessage);
+}
+
+bool Server::allowRateLimitedAction(Connection* connection,
+                                    const QString& subjectKey,
+                                    const QString& actionName,
+                                    const RateLimiter::Rule& rule,
+                                    const QString& errorPrefix,
+                                    QString& errorMessage)
+{
+    const QString bucketKey = QStringLiteral("%1:%2")
+                                  .arg(actionName)
+                                  .arg(subjectKey);
+    const RateLimiter::Decision decision = m_rateLimiter.allow(bucketKey, rule);
+    if (decision.allowed) {
+        return true;
+    }
+
+    const qint64 retryAfterSeconds = qMax<qint64>(1, (decision.retryAfterMs + 999) / 1000);
+    errorMessage = QStringLiteral("%1 Try again in %2 seconds.")
+                       .arg(errorPrefix)
+                       .arg(retryAfterSeconds);
+
+    Logger::instance().log(LogLevel::Warning,
+                           QStringLiteral("Rate limit hit for %1 on %2 from %3, retry in %4 ms")
+                               .arg(actionName)
+                               .arg(subjectKey)
+                               .arg(rateLimitPeerKey(connection))
+                               .arg(QString::number(decision.retryAfterMs)));
+    return false;
+}
+
+QString Server::rateLimitPeerKey(Connection* connection) const
+{
+    const QString peer = connection ? connection->peerAddress().trimmed() : QString();
+    return peer.isEmpty() ? QStringLiteral("<unknown>") : peer;
+}
+
+void Server::onPacketReceived(Connection* connection, const QJsonObject& packet)
+{
+    const QString type = packet.value(AuthProtocol::kFieldType).toString();
+    if (handleAuthPacket(connection, type, packet)) {
+        return;
+    }
+
+    const QString username = usernameFor(connection);
+    if (username.isEmpty()) {
+        sendAuthError(connection, QStringLiteral("Please login first"));
+        return;
+    }
+
+    if (handleAuthenticatedPacket(connection, username, type, packet)) {
+        return;
+    }
+
+    Logger::instance().log(LogLevel::Warning,
+                           QStringLiteral("Unhandled packet type from %1: %2")
+                               .arg(connection ? connection->peerAddress() : QStringLiteral("<unknown>"),
+                                    type.isEmpty() ? QStringLiteral("<empty>") : type));
 }
 
 void Server::onReliablePacketAcked(Connection*, const QJsonObject& packet)
@@ -405,7 +794,7 @@ void Server::sendDialogList(Connection* connection, const QString& username)
 {
     QJsonArray dialogs;
     const QStringList values = m_authService.loadDialogUsers(username);
-    for (const QString& dialogUser : values) {
+    for (auto dialogUser : values) {
         dialogs.append(dialogUser);
     }
 
@@ -432,7 +821,7 @@ void Server::sendHistory(Connection* connection, const QString& username, const 
     const QList<HistoryMessageRecord> records = chatUser == QStringLiteral("Broadcast")
                                                     ? m_authService.loadBroadcastHistory(limit)
                                                     : m_authService.loadPrivateHistory(username, chatUser, limit);
-    for (const HistoryMessageRecord& record : records) {
+    for (auto record : records) {
         items.append(QJsonObject{
             {"id", record.id},
             {"from", record.from},
@@ -454,7 +843,7 @@ void Server::sendHistory(Connection* connection, const QString& username, const 
 void Server::sendPendingPrivateMessages(Connection* connection, const QString& username)
 {
     const QList<PendingPrivateMessageRecord> records = m_authService.loadPendingPrivateMessages(username);
-    for (const PendingPrivateMessageRecord& record : records) {
+    for (auto record : records) {
         sendTo(connection,
                {
                    {"type", "private"},
@@ -510,4 +899,8 @@ void Server::unregisterConnection(Connection* connection)
         m_onlineUsers.remove(username);
     }
 }
+
+
+
+
 

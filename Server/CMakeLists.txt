@@ -13,14 +13,18 @@ add_executable(server
     server.cpp
     server.h
     protocol.h
-    logger.cpp
-    logger.h
     connection.cpp
     connection.h
     worker.cpp
     worker.h
     authservice.cpp
     authservice.h
+    ratelimiter.cpp
+    ratelimiter.h
+    logger.cpp
+    logger.h
+    ../Shared/authprotocol.h
+    ../Shared/transportprotocol.h
 )
 
 target_link_libraries(server
@@ -28,6 +32,8 @@ target_link_libraries(server
     Qt6::Network
     Qt6::Sql
 )
+
+target_include_directories(server PRIVATE ${CMAKE_SOURCE_DIR}/Shared)
 
 if (WIN32)
     get_target_property(QT_QMAKE_EXECUTABLE Qt6::qmake IMPORTED_LOCATION)
@@ -49,3 +55,4 @@ if (WIN32)
         VERBATIM
     )
 endif()
+

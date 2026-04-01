@@ -57,3 +57,18 @@ void ConnectionWindow::setOfflineModeAvailable(bool available)
 {
     m_offlineButton->setEnabled(available);
 }
+
+QString ConnectionWindow::endpointText() const
+{
+    return m_endpointLabel->text();
+}
+
+QString ConnectionWindow::statusText() const
+{
+    return m_statusLabel->text();
+}
+
+bool ConnectionWindow::isOfflineModeAvailable() const
+{
+    return m_offlineButton->isEnabled();
+}

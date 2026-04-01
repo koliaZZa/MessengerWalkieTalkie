@@ -1,10 +1,9 @@
 #pragma once
 
-#include <QHash>
 #include <QJsonArray>
-#include <QStringList>
 #include <QWidget>
 
+#include "chatstate.h"
 #include "historystore.h"
 
 class QLabel;
@@ -24,6 +23,7 @@ public:
     void activateSession(const QString& username, bool offlineMode);
     void deactivateSession();
     void setStatusText(const QString& text);
+    QString statusText() const;
     QString sessionUsername() const;
     bool isOfflineMode() const;
 
@@ -52,7 +52,6 @@ private:
     void appendMessage(const ChatMessage& message, bool persist = true);
     void clearLoadedHistory();
     QString currentChatKey() const;
-    void ensurePrivateDialog(const QString& username);
     void markCurrentPrivateMessagesRead();
     void rebuildDialogList(const QString& preferredChat = QString());
     void rebuildOnlineUsersList();
@@ -74,9 +73,5 @@ private:
     QPushButton* m_logoutButton;
     QPushButton* m_sendButton;
 
-    QString m_username;
-    QStringList m_onlineUsers;
-    QStringList m_privateDialogs;
-    QHash<QString, ChatMessage> m_messagesById;
-    QHash<QString, QStringList> m_chatMessages;
+    ChatSessionState m_state;
 };

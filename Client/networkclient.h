@@ -1,19 +1,15 @@
 #pragma once
 
 #include <QObject>
-#include <QByteArray>
-#include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QStringList>
 #include <QTcpSocket>
 #include <QTimer>
 
-struct PendingClientMessage {
-    QJsonObject payload;
-    int retries = 0;
-    qint64 retryAtMs = 0;
-};
+#include "networkpacketdispatcher.h"
+#include "networktransportstate.h"
+#include "../Shared/authprotocol.h"
 
 class NetworkClient : public QObject
 {
@@ -21,6 +17,7 @@ class NetworkClient : public QObject
 
 public:
     explicit NetworkClient(QObject* parent = nullptr);
+    ~NetworkClient() override;
 
     void connectToServer(const QString& host, quint16 port);
     void disconnectFromServer();
@@ -30,6 +27,8 @@ public:
 
     void login(const QString& username, const QString& password);
     void registerUser(const QString& username, const QString& password);
+    void resumeSession(const QString& username, const QString& sessionToken);
+    void logout();
     void checkUserExists(const QString& username);
     void requestDialogList();
     void requestHistory(const QString& chatUser, int limit = 100);
@@ -41,8 +40,9 @@ signals:
     void socketConnected();
     void socketDisconnected();
     void reconnectScheduled(int delayMs);
-    void authSucceeded(const QString& username);
+    void authSucceeded(const QString& username, const QString& sessionToken, qint64 sessionExpiresAt);
     void authFailed(const QString& message);
+    void sessionInvalid(const QString& message);
     void usersUpdated(const QStringList& users);
     void dialogsReceived(const QStringList& dialogs);
     void historyReceived(const QString& chatUser, const QJsonArray& items);
@@ -72,21 +72,12 @@ private:
     void processPacket(const QJsonObject& packet);
     void sendAck(const QString& id, quint32 seq);
     qint64 nowMs() const;
-    int nextReconnectDelayMs() const;
 
     QTcpSocket m_socket;
-    QByteArray m_buffer;
     QTimer m_pingTimer;
     QTimer m_retryTimer;
     QTimer m_reconnectTimer;
-    QHash<QString, PendingClientMessage> m_pendingMessages;
-    quint32 m_nextOutgoingSeq {0};
-    quint32 m_lastIncomingSeq {0};
-    qint64 m_lastPongAtMs {0};
-    QString m_host {QStringLiteral("127.0.0.1")};
-    quint16 m_port {5555};
-    QString m_username;
-    bool m_manualDisconnect {false};
-    bool m_reconnectEnabled {true};
-    int m_reconnectAttempt {0};
+    NetworkPacketDispatcher m_packetDispatcher;
+    NetworkTransportState m_transportState;
 };
+

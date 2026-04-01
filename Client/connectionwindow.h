@@ -15,6 +15,9 @@ public:
     void setEndpoint(const QString& host, quint16 port);
     void setStatusText(const QString& text);
     void setOfflineModeAvailable(bool available);
+    QString endpointText() const;
+    QString statusText() const;
+    bool isOfflineModeAvailable() const;
 
 signals:
     void settingsRequested();

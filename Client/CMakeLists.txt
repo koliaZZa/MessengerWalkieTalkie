@@ -10,6 +10,14 @@ find_package(Qt6 REQUIRED COMPONENTS Core Network Widgets Sql)
 
 add_executable(client WIN32
     main.cpp
+    clientflowstate.cpp
+    clientflowstate.h
+    networkpacketdispatcher.cpp
+    networkpacketdispatcher.h
+    networktransportstate.cpp
+    networktransportstate.h
+    chatstate.cpp
+    chatstate.h
     chatwindow.cpp
     chatwindow.h
     clientflowcontroller.cpp
@@ -23,6 +31,8 @@ add_executable(client WIN32
     networkclient.cpp
     networkclient.h
     protocol.h
+    ../Shared/authprotocol.h
+    ../Shared/transportprotocol.h
 )
 
 target_link_libraries(client
@@ -31,6 +41,8 @@ target_link_libraries(client
     Qt6::Widgets
     Qt6::Sql
 )
+
+target_include_directories(client PRIVATE ${CMAKE_SOURCE_DIR}/Shared)
 
 if (WIN32)
     get_target_property(QT_QMAKE_EXECUTABLE Qt6::qmake IMPORTED_LOCATION)
@@ -52,3 +64,4 @@ if (WIN32)
         VERBATIM
     )
 endif()
+

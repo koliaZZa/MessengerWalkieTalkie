@@ -5,6 +5,8 @@
 #include <QSqlDatabase>
 #include <QStringList>
 
+#include "../Shared/authprotocol.h"
+
 struct ChatMessage {
     QString id;
     QString chatKey;
@@ -17,18 +19,19 @@ struct ChatMessage {
 
 struct LastSessionInfo {
     QString username;
-    QString password;
     QString host;
     quint16 port = 0;
+    QString sessionToken;
+    qint64 sessionExpiresAt = 0;
 
     bool hasStoredIdentity() const
     {
         return !username.isEmpty() && !host.isEmpty() && port > 0;
     }
 
-    bool hasCredentials() const
+    bool hasSessionToken() const
     {
-        return hasStoredIdentity() && !password.isEmpty();
+        return hasStoredIdentity() && !sessionToken.isEmpty() && sessionExpiresAt > 0;
     }
 
     bool isValid() const
@@ -62,4 +65,3 @@ private:
     QString m_connectionName;
     QSqlDatabase m_database;
 };
-

@@ -29,12 +29,17 @@ bool HistoryStore::init(const QString& databasePath)
     }
 
     const QString finalPath = databasePath.isEmpty() ? defaultDatabasePath() : databasePath;
-    QFileInfo info(finalPath);
-    QDir().mkpath(info.dir().absolutePath());
+    if (!finalPath.startsWith(QStringLiteral("file:"), Qt::CaseInsensitive)) {
+        QFileInfo info(finalPath);
+        QDir().mkpath(info.dir().absolutePath());
+    }
 
     m_connectionName = QStringLiteral("client_history_%1")
                            .arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
     m_database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), m_connectionName);
+    if (finalPath.startsWith(QStringLiteral("file:"), Qt::CaseInsensitive)) {
+        m_database.setConnectOptions(QStringLiteral("QSQLITE_OPEN_URI"));
+    }
     m_database.setDatabaseName(finalPath);
     if (!m_database.open()) {
         return false;
@@ -146,11 +151,13 @@ void HistoryStore::saveLastSession(const LastSessionInfo& session)
 
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
-        "INSERT OR REPLACE INTO last_session(id, username, password, host, port) VALUES(1, ?, ?, ?, ?)"));
+        "INSERT OR REPLACE INTO last_session(id, username, host, port, session_token, session_expires_at) "
+        "VALUES(1, ?, ?, ?, ?, ?)"));
     query.addBindValue(session.username);
-    query.addBindValue(session.password);
     query.addBindValue(session.host);
     query.addBindValue(static_cast<int>(session.port));
+    query.addBindValue(session.sessionToken);
+    query.addBindValue(session.sessionExpiresAt);
     query.exec();
 }
 
@@ -162,15 +169,17 @@ LastSessionInfo HistoryStore::loadLastSession() const
     }
 
     QSqlQuery query(m_database);
-    query.prepare(QStringLiteral("SELECT username, password, host, port FROM last_session WHERE id = 1"));
+    query.prepare(QStringLiteral(
+        "SELECT username, host, port, session_token, session_expires_at FROM last_session WHERE id = 1"));
     if (!query.exec() || !query.next()) {
         return session;
     }
 
     session.username = query.value(0).toString();
-    session.password = query.value(1).toString();
-    session.host = query.value(2).toString();
-    session.port = static_cast<quint16>(query.value(3).toUInt());
+    session.host = query.value(1).toString();
+    session.port = static_cast<quint16>(query.value(2).toUInt());
+    session.sessionToken = query.value(3).toString();
+    session.sessionExpiresAt = query.value(4).toLongLong();
     return session;
 }
 
@@ -211,12 +220,13 @@ bool HistoryStore::ensureSchema()
             "CREATE TABLE IF NOT EXISTS last_session("
             "id INTEGER PRIMARY KEY CHECK(id = 1),"
             "username TEXT NOT NULL,"
-            "password TEXT NOT NULL DEFAULT '',"
             "host TEXT NOT NULL,"
-            "port INTEGER NOT NULL)")
+            "port INTEGER NOT NULL,"
+            "session_token TEXT NOT NULL DEFAULT '',"
+            "session_expires_at INTEGER NOT NULL DEFAULT 0)")
     };
 
-    for (const QString& statement : statements) {
+    for (auto& statement : statements) {
         if (!query.exec(statement)) {
             return false;
         }
@@ -226,19 +236,18 @@ bool HistoryStore::ensureSchema()
         return false;
     }
 
-    bool hasPasswordColumn = false;
+    QStringList columns;
     while (query.next()) {
-        if (query.value(1).toString() == QStringLiteral("password")) {
-            hasPasswordColumn = true;
-            break;
-        }
+        columns.append(query.value(1).toString());
     }
 
-    if (!hasPasswordColumn
-        && !query.exec(QStringLiteral(
-            "ALTER TABLE last_session ADD COLUMN password TEXT NOT NULL DEFAULT ''"))) {
-        return false;
-    }
-
-    return true;
+    return columns == QStringList({
+        QStringLiteral("id"),
+        QStringLiteral("username"),
+        QStringLiteral("host"),
+        QStringLiteral("port"),
+        QStringLiteral("session_token"),
+        QStringLiteral("session_expires_at")
+    });
 }
+

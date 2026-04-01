@@ -5,6 +5,8 @@
 #include <QSqlDatabase>
 #include <QStringList>
 
+#include "../Shared/authprotocol.h"
+
 struct HistoryMessageRecord {
     QString id;
     QString from;
@@ -31,8 +33,19 @@ public:
     ~AuthService() override;
 
     bool init(const QString& databasePath = QStringLiteral("users.db"));
-    bool registerUser(const QString& username, const QString& password, QString& errorMessage);
-    bool loginUser(const QString& username, const QString& password, QString& errorMessage) const;
+    bool registerUser(const QString& username,
+                      const QString& password,
+                      QString& errorMessage,
+                      AuthProtocol::SessionInfo* sessionInfo = nullptr);
+    bool loginUser(const QString& username,
+                   const QString& password,
+                   QString& errorMessage,
+                   AuthProtocol::SessionInfo* sessionInfo = nullptr);
+    bool resumeSession(const QString& username,
+                       const QString& sessionToken,
+                       QString& errorMessage,
+                       AuthProtocol::SessionInfo* sessionInfo = nullptr);
+    bool invalidateSession(const QString& username);
     bool userExists(const QString& username) const;
     bool storeBroadcastMessage(const QString& id,
                                const QString& from,
@@ -55,6 +68,19 @@ public:
 private:
     bool ensureSchema();
     QString hashPassword(const QString& password) const;
+    bool verifyPassword(const QString& password, const QString& storedHash) const;
+    QByteArray randomBytes(int count) const;
+    QByteArray hmacSha256(const QByteArray& key, const QByteArray& message) const;
+    QByteArray derivePbkdf2(const QByteArray& password,
+                            const QByteArray& salt,
+                            int iterations,
+                            int keyLength) const;
+    QString generateSessionToken() const;
+    QString hashSessionToken(const QString& sessionToken) const;
+    bool issueSession(const QString& username,
+                      QString& errorMessage,
+                      AuthProtocol::SessionInfo* sessionInfo = nullptr);
+    bool removeExpiredSession(const QString& username);
     bool isUsernameValid(const QString& username) const;
 
     QString m_connectionName;

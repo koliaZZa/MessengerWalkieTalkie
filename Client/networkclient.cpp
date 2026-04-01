@@ -8,10 +8,7 @@
 
 namespace {
 
-constexpr int kRetryScheduleMs[] = {2000, 4000, 8000, 16000, 32000};
 constexpr int kPingIntervalMs = 5000;
-constexpr int kPongTimeoutMs = 15000;
-constexpr int kReconnectScheduleMs[] = {1000, 2000, 4000, 8000, 16000, 32000};
 
 }
 
@@ -31,21 +28,37 @@ NetworkClient::NetworkClient(QObject* parent)
 
     m_reconnectTimer.setSingleShot(true);
     connect(&m_reconnectTimer, &QTimer::timeout, this, &NetworkClient::reconnectIfNeeded);
+
+    connect(&m_packetDispatcher, &NetworkPacketDispatcher::authSucceeded, this, &NetworkClient::authSucceeded);
+    connect(&m_packetDispatcher, &NetworkPacketDispatcher::authFailed, this, &NetworkClient::authFailed);
+    connect(&m_packetDispatcher, &NetworkPacketDispatcher::sessionInvalid, this, &NetworkClient::sessionInvalid);
+    connect(&m_packetDispatcher, &NetworkPacketDispatcher::usersUpdated, this, &NetworkClient::usersUpdated);
+    connect(&m_packetDispatcher, &NetworkPacketDispatcher::dialogsReceived, this, &NetworkClient::dialogsReceived);
+    connect(&m_packetDispatcher, &NetworkPacketDispatcher::historyReceived, this, &NetworkClient::historyReceived);
+    connect(&m_packetDispatcher, &NetworkPacketDispatcher::userLookupFinished, this, &NetworkClient::userLookupFinished);
+    connect(&m_packetDispatcher, &NetworkPacketDispatcher::publicMessageReceived, this, &NetworkClient::publicMessageReceived);
+    connect(&m_packetDispatcher, &NetworkPacketDispatcher::privateMessageReceived, this, &NetworkClient::privateMessageReceived);
+    connect(&m_packetDispatcher, &NetworkPacketDispatcher::messageQueued, this, &NetworkClient::messageQueued);
+    connect(&m_packetDispatcher, &NetworkPacketDispatcher::messageDelivered, this, &NetworkClient::messageDelivered);
+    connect(&m_packetDispatcher, &NetworkPacketDispatcher::messageRead, this, &NetworkClient::messageRead);
+    connect(&m_packetDispatcher, &NetworkPacketDispatcher::transportError, this, &NetworkClient::transportError);
 }
 
+NetworkClient::~NetworkClient()
+{
+    disconnect(&m_socket, nullptr, this, nullptr);
+    m_reconnectTimer.stop();
+    m_retryTimer.stop();
+    m_pingTimer.stop();
+
+    if (m_socket.state() != QAbstractSocket::UnconnectedState) {
+        m_socket.abort();
+    }
+}
 
 void NetworkClient::connectToServer(const QString& host, quint16 port)
 {
-    m_host = host.trimmed().isEmpty() ? QStringLiteral("127.0.0.1") : host.trimmed();
-    m_port = port == 0 ? 5555 : port;
-    m_manualDisconnect = false;
-    m_reconnectEnabled = true;
-    m_reconnectAttempt = 0;
-    m_buffer.clear();
-    m_pendingMessages.clear();
-    m_nextOutgoingSeq = 0;
-    m_lastIncomingSeq = 0;
-    m_lastPongAtMs = 0;
+    m_transportState.startConnection(host, port);
 
     m_pingTimer.stop();
     m_retryTimer.stop();
@@ -57,13 +70,10 @@ void NetworkClient::connectToServer(const QString& host, quint16 port)
 
 void NetworkClient::disconnectFromServer()
 {
-    m_manualDisconnect = true;
-    m_reconnectEnabled = false;
+    m_transportState.prepareDisconnect();
     m_reconnectTimer.stop();
     m_pingTimer.stop();
     m_retryTimer.stop();
-    m_pendingMessages.clear();
-    m_buffer.clear();
 
     if (m_socket.state() == QAbstractSocket::UnconnectedState) {
         emit statusChanged(QStringLiteral("Disconnected"));
@@ -83,22 +93,22 @@ bool NetworkClient::isConnected() const
 
 QString NetworkClient::host() const
 {
-    return m_host;
+    return m_transportState.host();
 }
 
 quint16 NetworkClient::port() const
 {
-    return m_port;
+    return m_transportState.port();
 }
 
 void NetworkClient::login(const QString& username, const QString& password)
 {
-    m_username = username.trimmed();
+    const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
 
     QJsonObject packet{
-        {"type", "login"},
-        {"username", m_username},
-        {"password", password},
+        {AuthProtocol::kFieldType, QString::fromLatin1(AuthProtocol::kTypeLogin)},
+        {AuthProtocol::kFieldUsername, normalizedUsername},
+        {AuthProtocol::kFieldPassword, password},
         {"client_mode", QStringLiteral("desktop")},
         {"supports_history", true}
     };
@@ -108,19 +118,34 @@ void NetworkClient::login(const QString& username, const QString& password)
 
 void NetworkClient::registerUser(const QString& username, const QString& password)
 {
-    m_username = username.trimmed();
+    const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
     sendUnreliable({
-        {"type", "register"},
-        {"username", m_username},
-        {"password", password}
+        {AuthProtocol::kFieldType, QString::fromLatin1(AuthProtocol::kTypeRegister)},
+        {AuthProtocol::kFieldUsername, normalizedUsername},
+        {AuthProtocol::kFieldPassword, password}
     });
+}
+
+void NetworkClient::resumeSession(const QString& username, const QString& sessionToken)
+{
+    const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
+    sendUnreliable(AuthProtocol::makeResumeSessionPacket(normalizedUsername, sessionToken));
+}
+
+void NetworkClient::logout()
+{
+    if (m_socket.state() == QAbstractSocket::ConnectedState) {
+        sendUnreliable(AuthProtocol::makeLogoutPacket());
+        m_socket.flush();
+        m_socket.waitForBytesWritten(500);
+    }
 }
 
 void NetworkClient::checkUserExists(const QString& username)
 {
     sendUnreliable({
         {"type", "check_user"},
-        {"username", username.trimmed()}
+        {"username", AuthProtocol::normalizeUsername(username)}
     });
 }
 
@@ -167,13 +192,14 @@ void NetworkClient::sendReadReceipt(const QString& recipient, const QString& mes
 void NetworkClient::onConnected()
 {
     m_reconnectTimer.stop();
-    m_reconnectAttempt = 0;
-    m_lastPongAtMs = nowMs();
+    m_transportState.markConnected(nowMs());
     m_pingTimer.start();
     m_retryTimer.start();
 
     emit socketConnected();
-    emit statusChanged(QStringLiteral("Connected to %1:%2").arg(m_host).arg(m_port));
+    emit statusChanged(QStringLiteral("Connected to %1:%2")
+                           .arg(m_transportState.host())
+                           .arg(m_transportState.port()));
 }
 
 void NetworkClient::onDisconnected()
@@ -183,9 +209,8 @@ void NetworkClient::onDisconnected()
 
     emit socketDisconnected();
 
-    if (m_manualDisconnect) {
+    if (m_transportState.consumeManualDisconnect()) {
         emit statusChanged(QStringLiteral("Disconnected"));
-        m_manualDisconnect = false;
         return;
     }
 
@@ -194,11 +219,12 @@ void NetworkClient::onDisconnected()
 
 void NetworkClient::onReadyRead()
 {
-    m_buffer.append(m_socket.readAll());
+    QByteArray& buffer = m_transportState.incomingBuffer();
+    buffer.append(m_socket.readAll());
 
     while (true) {
         QJsonObject packet;
-        const Protocol::DecodeStatus status = Protocol::tryDecode(m_buffer, packet);
+        const Protocol::DecodeStatus status = Protocol::tryDecode(buffer, packet);
         if (status == Protocol::DecodeStatus::NeedMoreData) {
             return;
         }
@@ -221,8 +247,7 @@ void NetworkClient::onSocketError(QAbstractSocket::SocketError)
 {
     emit transportError(m_socket.errorString());
 
-    if (!m_manualDisconnect && m_reconnectEnabled
-        && m_socket.state() == QAbstractSocket::UnconnectedState) {
+    if (m_transportState.canReconnect() && m_socket.state() == QAbstractSocket::UnconnectedState) {
         scheduleReconnect();
     }
 }
@@ -235,28 +260,17 @@ void NetworkClient::sendPing()
 void NetworkClient::retryPendingMessages()
 {
     const qint64 currentMs = nowMs();
+    const RetryActions actions = m_transportState.collectRetryActions(currentMs);
 
-    for (auto it = m_pendingMessages.begin(); it != m_pendingMessages.end();) {
-        PendingClientMessage& pending = it.value();
-        if (currentMs < pending.retryAtMs) {
-            ++it;
-            continue;
-        }
-
-        if (pending.retries >= 5) {
-            emit transportError(QStringLiteral("Message dropped after retries: %1").arg(it.key()));
-            it = m_pendingMessages.erase(it);
-            continue;
-        }
-
-        const int delayIndex = qMin(pending.retries + 1, 4);
-        pending.retryAtMs = currentMs + kRetryScheduleMs[delayIndex];
-        ++pending.retries;
-        sendUnreliable(pending.payload);
-        ++it;
+    for (auto droppedId : actions.droppedMessageIds) {
+        emit transportError(QStringLiteral("Message dropped after retries: %1").arg(droppedId));
     }
 
-    if (m_socket.state() == QAbstractSocket::ConnectedState && currentMs - m_lastPongAtMs > kPongTimeoutMs) {
+    for (auto packet : actions.resendPackets) {
+        sendUnreliable(packet);
+    }
+
+    if (m_socket.state() == QAbstractSocket::ConnectedState && m_transportState.isHeartbeatExpired(currentMs)) {
         emit statusChanged(QStringLiteral("Heartbeat timeout, reconnecting"));
         m_socket.abort();
     }
@@ -264,7 +278,7 @@ void NetworkClient::retryPendingMessages()
 
 void NetworkClient::reconnectIfNeeded()
 {
-    if (!m_reconnectEnabled || m_manualDisconnect) {
+    if (!m_transportState.canReconnect()) {
         return;
     }
 
@@ -275,22 +289,26 @@ void NetworkClient::reconnectIfNeeded()
 
 void NetworkClient::startConnectAttempt()
 {
-    emit statusChanged(QStringLiteral("Connecting to %1:%2").arg(m_host).arg(m_port));
-    m_socket.connectToHost(m_host, m_port);
+    emit statusChanged(QStringLiteral("Connecting to %1:%2")
+                           .arg(m_transportState.host())
+                           .arg(m_transportState.port()));
+    m_socket.connectToHost(m_transportState.host(), m_transportState.port());
 }
 
 void NetworkClient::scheduleReconnect()
 {
-    if (!m_reconnectEnabled || m_manualDisconnect || m_reconnectTimer.isActive()) {
+    if (!m_transportState.canReconnect() || m_reconnectTimer.isActive()) {
         return;
     }
 
-    const int delayMs = nextReconnectDelayMs();
-    ++m_reconnectAttempt;
+    const int delayMs = m_transportState.scheduleReconnect();
+    if (delayMs <= 0) {
+        return;
+    }
     emit reconnectScheduled(delayMs);
     emit statusChanged(QStringLiteral("Reconnecting to %1:%2 in %3 s")
-                           .arg(m_host)
-                           .arg(m_port)
+                           .arg(m_transportState.host())
+                           .arg(m_transportState.port())
                            .arg((delayMs + 999) / 1000));
     m_reconnectTimer.start(delayMs);
 }
@@ -308,12 +326,8 @@ QString NetworkClient::sendReliable(QJsonObject packet)
         packet["id"] = id;
     }
 
-    packet["seq"] = static_cast<qint64>(++m_nextOutgoingSeq);
-
-    PendingClientMessage pending;
-    pending.payload = packet;
-    pending.retryAtMs = nowMs() + kRetryScheduleMs[0];
-    m_pendingMessages.insert(id, pending);
+    packet["seq"] = static_cast<qint64>(m_transportState.nextOutgoingSequence());
+    m_transportState.trackReliableMessage(id, packet, nowMs());
 
     sendUnreliable(packet);
     return id;
@@ -324,12 +338,12 @@ void NetworkClient::processPacket(const QJsonObject& packet)
     const QString type = packet.value("type").toString();
 
     if (type == "ack") {
-        m_pendingMessages.remove(packet.value("id").toString());
+        m_transportState.acknowledgeReliableMessage(packet.value("id").toString());
         return;
     }
 
     if (type == "pong") {
-        m_lastPongAtMs = nowMs();
+        m_transportState.markPongReceived(nowMs());
         return;
     }
 
@@ -341,97 +355,18 @@ void NetworkClient::processPacket(const QJsonObject& packet)
     const quint32 seq = packet.value("seq").toInt();
     if (seq > 0) {
         const QString id = packet.value("id").toString();
-        if (seq <= m_lastIncomingSeq) {
+        if (m_transportState.isDuplicateIncomingSequence(seq)) {
             sendAck(id, seq);
             return;
         }
 
-        m_lastIncomingSeq = seq;
+        m_transportState.markIncomingSequence(seq);
         sendAck(id, seq);
     }
 
-    if (type == "auth_ok") {
-        const QString username = packet.value("username").toString();
-        if (!username.isEmpty()) {
-            m_username = username;
-        }
-        emit authSucceeded(m_username);
-        return;
-    }
-
-    if (type == "auth_error") {
-        emit authFailed(packet.value("message").toString());
-        return;
-    }
-
-    if (type == "users") {
-        QStringList users;
-        const QJsonArray values = packet.value("list").toArray();
-        for (const QJsonValue& value : values) {
-            users.append(value.toString());
-        }
-        emit usersUpdated(users);
-        return;
-    }
-
-    if (type == "dialogs") {
-        QStringList dialogs;
-        const QJsonArray values = packet.value("list").toArray();
-        for (const QJsonValue& value : values) {
-            dialogs.append(value.toString());
-        }
-        emit dialogsReceived(dialogs);
-        return;
-    }
-
-    if (type == "history") {
-        emit historyReceived(packet.value("with").toString(), packet.value("items").toArray());
-        return;
-    }
-
-    if (type == "user_check_result") {
-        emit userLookupFinished(packet.value("username").toString(),
-                                packet.value("exists").toBool(),
-                                packet.value("online").toBool());
-        return;
-    }
-
-    if (type == "message") {
-        emit publicMessageReceived(packet.value("id").toString(),
-                                   packet.value("from").toString(),
-                                   packet.value("text").toString(),
-                                   packet.value("created_at").toVariant().toLongLong());
-        return;
-    }
-
-    if (type == "private") {
-        emit privateMessageReceived(packet.value("id").toString(),
-                                    packet.value("from").toString(),
-                                    packet.value("text").toString(),
-                                    packet.value("created_at").toVariant().toLongLong());
-        return;
-    }
-
-    if (type == "queued") {
-        emit messageQueued(packet.value("id").toString(),
-                           packet.value("to").toString(),
-                           packet.value("created_at").toVariant().toLongLong());
-        return;
-    }
-
-    if (type == "delivered") {
-        emit messageDelivered(packet.value("id").toString(),
-                              packet.value("created_at").toVariant().toLongLong());
-        return;
-    }
-
-    if (type == "read") {
-        emit messageRead(packet.value("id").toString(), packet.value("from").toString());
-        return;
-    }
-
-    if (type == "error") {
-        emit transportError(packet.value("message").toString());
+    QString errorMessage;
+    if (m_packetDispatcher.dispatch(packet, &errorMessage) == NetworkPacketDispatcher::DispatchResult::InvalidPacket) {
+        emit transportError(errorMessage);
     }
 }
 
@@ -452,10 +387,3 @@ qint64 NetworkClient::nowMs() const
 {
     return QDateTime::currentMSecsSinceEpoch();
 }
-
-int NetworkClient::nextReconnectDelayMs() const
-{
-    const int index = qMin(m_reconnectAttempt, static_cast<int>(std::size(kReconnectScheduleMs)) - 1);
-    return kReconnectScheduleMs[index];
-}
-

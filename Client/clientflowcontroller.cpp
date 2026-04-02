@@ -58,6 +58,11 @@ void ClientFlowController::setInitialEndpoint(const QString& host, quint16 port)
     m_initialPort = port;
 }
 
+void ClientFlowController::setTlsConfiguration(const TlsConfiguration::ClientSettings& settings)
+{
+    m_client->setTlsConfiguration(settings);
+}
+
 ClientFlowController::~ClientFlowController()
 {
     m_client->disconnectFromServer();

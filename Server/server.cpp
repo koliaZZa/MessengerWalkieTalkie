@@ -47,6 +47,12 @@ bool Server::start(quint16 port)
 {
     Logger::instance().start();
 
+    QString tlsError;
+    if (m_tcpServer.isTlsEnabled() && !TlsConfiguration::ensureTlsSupport(&tlsError)) {
+        Logger::instance().log(LogLevel::Error, tlsError);
+        return false;
+    }
+
     if (!m_authService.init(m_databasePath)) {
         Logger::instance().log(LogLevel::Error, QStringLiteral("Failed to initialize auth storage"));
         return false;
@@ -68,7 +74,10 @@ bool Server::start(quint16 port)
     const bool ok = m_tcpServer.listen(QHostAddress::AnyIPv4, port);
     if (ok) {
         Logger::instance().log(LogLevel::Info,
-                               QStringLiteral("Server listening on port %1").arg(port));
+                               QStringLiteral("Server listening on port %1%2")
+                                   .arg(port)
+                                   .arg(m_tcpServer.isTlsEnabled() ? QStringLiteral(" with TLS")
+                                                                   : QString()));
     }
 
     return ok;
@@ -83,6 +92,20 @@ void Server::setDatabasePath(const QString& databasePath)
     m_databasePath = databasePath.trimmed().isEmpty()
                          ? QStringLiteral("users.db")
                          : databasePath.trimmed();
+}
+
+void Server::setTlsConfiguration(const TlsConfiguration::ServerSettings& settings)
+{
+    if (m_tcpServer.isListening()) {
+        return;
+    }
+
+    m_tcpServer.setTlsConfiguration(settings);
+}
+
+bool Server::isTlsEnabled() const
+{
+    return m_tcpServer.isTlsEnabled();
 }
 
 quint16 Server::listeningPort() const

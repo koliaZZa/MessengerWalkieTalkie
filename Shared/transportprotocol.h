@@ -5,7 +5,6 @@
 #include <QIODevice>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QTcpSocket>
 
 namespace Protocol {
 
@@ -53,14 +52,14 @@ inline QByteArray encodePacket(const QJsonObject& object)
     return packet;
 }
 
-inline bool writePacket(QTcpSocket* socket, const QJsonObject& object)
+inline bool writePacket(QIODevice* device, const QJsonObject& object)
 {
-    if (!socket) {
+    if (!device) {
         return false;
     }
 
     const QByteArray packet = encodePacket(object);
-    return socket->write(packet) == packet.size();
+    return device->write(packet) == packet.size();
 }
 
 inline DecodeStatus tryDecode(QByteArray& buffer, QJsonObject& outObject)

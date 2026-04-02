@@ -6,6 +6,7 @@
 
 #include "clientflowstate.h"
 #include "historystore.h"
+#include "../Shared/tlsconfiguration.h"
 
 class ChatWindow;
 class ConnectionWindow;
@@ -25,6 +26,7 @@ public:
     ~ClientFlowController() override;
 
     void setInitialEndpoint(const QString& host, quint16 port);
+    void setTlsConfiguration(const TlsConfiguration::ClientSettings& settings);
     void start();
     void setServerSettingsProvider(ServerSettingsProvider provider);
 

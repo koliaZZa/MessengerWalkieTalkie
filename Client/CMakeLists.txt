@@ -32,6 +32,7 @@ add_executable(client WIN32
     networkclient.h
     protocol.h
     ../Shared/authprotocol.h
+    ../Shared/tlsconfiguration.h
     ../Shared/transportprotocol.h
 )
 

@@ -2,8 +2,10 @@
 
 #include "logger.h"
 #include "protocol.h"
+#include "../Shared/tlsconfiguration.h"
 
 #include <QDateTime>
+#include <QSslSocket>
 #include <QUuid>
 
 namespace {
@@ -47,17 +49,29 @@ void Connection::start()
     connect(m_socket, &QTcpSocket::disconnected, this, &Connection::onSocketDisconnected);
     connect(m_socket, &QTcpSocket::errorOccurred, this, &Connection::onSocketError);
 
-    m_lastPongAtMs = nowMs();
-    m_retryTimer.start();
-    m_pingTimer.start();
+    if (auto* sslSocket = qobject_cast<QSslSocket*>(m_socket)) {
+        connect(sslSocket, &QSslSocket::encrypted, this, &Connection::onEncrypted);
+        connect(sslSocket, &QSslSocket::sslErrors, this, &Connection::onSslErrors);
 
-    Logger::instance().log(LogLevel::Info,
-                           QStringLiteral("Client connected from %1").arg(peerAddress()));
+        Logger::instance().log(LogLevel::Info,
+                               QStringLiteral("Starting TLS handshake with %1").arg(peerAddress()));
+        sslSocket->startServerEncryption();
+        if (sslSocket->isEncrypted()) {
+            finishStartup();
+        }
+        return;
+    }
+
+    finishStartup();
 }
 
 void Connection::sendUnreliable(const QJsonObject& packet)
 {
     if (!m_socket || m_socket->state() != QAbstractSocket::ConnectedState) {
+        return;
+    }
+
+    if (auto* sslSocket = qobject_cast<QSslSocket*>(m_socket); sslSocket && !sslSocket->isEncrypted()) {
         return;
     }
 
@@ -110,6 +124,10 @@ void Connection::onReadyRead()
         return;
     }
 
+    if (auto* sslSocket = qobject_cast<QSslSocket*>(m_socket); sslSocket && !sslSocket->isEncrypted()) {
+        return;
+    }
+
     m_buffer.append(m_socket->readAll());
 
     while (true) {
@@ -135,10 +153,18 @@ void Connection::onReadyRead()
     }
 }
 
+void Connection::onEncrypted()
+{
+    finishStartup();
+}
+
 void Connection::onSocketDisconnected()
 {
     Logger::instance().log(LogLevel::Warning,
-                           QStringLiteral("Client disconnected: %1").arg(peerAddress()));
+                           QStringLiteral("%1 disconnected: %2")
+                               .arg(qobject_cast<QSslSocket*>(m_socket) ? QStringLiteral("TLS client")
+                                                                        : QStringLiteral("Client"))
+                               .arg(peerAddress()));
     emit closed(this);
 }
 
@@ -151,6 +177,15 @@ void Connection::onSocketError(QAbstractSocket::SocketError)
     Logger::instance().log(LogLevel::Warning,
                            QStringLiteral("Socket error from %1: %2")
                                .arg(peerAddress(), m_socket->errorString()));
+}
+
+void Connection::onSslErrors(const QList<QSslError>& errors)
+{
+    Logger::instance().log(LogLevel::Warning,
+                           QStringLiteral("TLS error from %1: %2")
+                               .arg(peerAddress(), TlsConfiguration::sslErrorsToString(errors)));
+    closeConnection();
+    emit closed(this);
 }
 
 void Connection::checkPendingMessages()
@@ -251,4 +286,22 @@ void Connection::sendAck(const QString& messageId, quint32 seq)
 qint64 Connection::nowMs() const
 {
     return QDateTime::currentMSecsSinceEpoch();
+}
+
+void Connection::finishStartup()
+{
+    if (m_transportReady) {
+        return;
+    }
+
+    m_transportReady = true;
+    m_lastPongAtMs = nowMs();
+    m_retryTimer.start();
+    m_pingTimer.start();
+
+    Logger::instance().log(LogLevel::Info,
+                           QStringLiteral("%1 established with %2")
+                               .arg(qobject_cast<QSslSocket*>(m_socket) ? QStringLiteral("TLS session")
+                                                                        : QStringLiteral("Client connection"))
+                               .arg(peerAddress()));
 }

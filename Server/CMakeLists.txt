@@ -24,6 +24,8 @@ add_executable(server
     logger.cpp
     logger.h
     ../Shared/authprotocol.h
+    tlstcpserver.h
+    ../Shared/tlsconfiguration.h
     ../Shared/transportprotocol.h
 )
 

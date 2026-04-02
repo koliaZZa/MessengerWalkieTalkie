@@ -4,6 +4,7 @@
 #include <QByteArray>
 #include <QHash>
 #include <QJsonObject>
+#include <QSslError>
 #include <QTimer>
 #include <QTcpSocket>
 
@@ -36,12 +37,15 @@ public slots:
 
 private slots:
     void onReadyRead();
+    void onEncrypted();
     void onSocketDisconnected();
     void onSocketError(QAbstractSocket::SocketError socketError);
+    void onSslErrors(const QList<QSslError>& errors);
     void checkPendingMessages();
     void sendPing();
 
 private:
+    void finishStartup();
     void processIncomingPacket(const QJsonObject& packet);
     void sendAck(const QString& messageId, quint32 seq);
     qint64 nowMs() const;
@@ -54,6 +58,7 @@ private:
     quint32 m_nextOutgoingSeq {0};
     quint32 m_lastIncomingSeq {0};
     qint64 m_lastPongAtMs {0};
+    bool m_transportReady {false};
 };
 
 Q_DECLARE_METATYPE(Connection*)

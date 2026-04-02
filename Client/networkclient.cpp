@@ -4,6 +4,7 @@
 
 #include <QDateTime>
 #include <QJsonArray>
+#include <QSslSocket>
 #include <QUuid>
 
 namespace {
@@ -15,10 +16,12 @@ constexpr int kPingIntervalMs = 5000;
 NetworkClient::NetworkClient(QObject* parent)
     : QObject(parent)
 {
-    connect(&m_socket, &QTcpSocket::connected, this, &NetworkClient::onConnected);
-    connect(&m_socket, &QTcpSocket::disconnected, this, &NetworkClient::onDisconnected);
-    connect(&m_socket, &QTcpSocket::readyRead, this, &NetworkClient::onReadyRead);
-    connect(&m_socket, &QTcpSocket::errorOccurred, this, &NetworkClient::onSocketError);
+    connect(&m_socket, &QSslSocket::connected, this, &NetworkClient::onTcpConnected);
+    connect(&m_socket, &QSslSocket::encrypted, this, &NetworkClient::onEncrypted);
+    connect(&m_socket, &QSslSocket::disconnected, this, &NetworkClient::onDisconnected);
+    connect(&m_socket, &QSslSocket::readyRead, this, &NetworkClient::onReadyRead);
+    connect(&m_socket, &QSslSocket::errorOccurred, this, &NetworkClient::onSocketError);
+    connect(&m_socket, &QSslSocket::sslErrors, this, &NetworkClient::onSslErrors);
 
     m_pingTimer.setInterval(kPingIntervalMs);
     connect(&m_pingTimer, &QTimer::timeout, this, &NetworkClient::sendPing);
@@ -44,6 +47,11 @@ NetworkClient::NetworkClient(QObject* parent)
     connect(&m_packetDispatcher, &NetworkPacketDispatcher::transportError, this, &NetworkClient::transportError);
 }
 
+void NetworkClient::setTlsConfiguration(const TlsConfiguration::ClientSettings& settings)
+{
+    m_tlsSettings = settings;
+}
+
 NetworkClient::~NetworkClient()
 {
     disconnect(&m_socket, nullptr, this, nullptr);
@@ -59,6 +67,7 @@ NetworkClient::~NetworkClient()
 void NetworkClient::connectToServer(const QString& host, quint16 port)
 {
     m_transportState.startConnection(host, port);
+    m_reconnectBlocked = false;
 
     m_pingTimer.stop();
     m_retryTimer.stop();
@@ -88,7 +97,13 @@ void NetworkClient::disconnectFromServer()
 
 bool NetworkClient::isConnected() const
 {
-    return m_socket.state() == QAbstractSocket::ConnectedState;
+    return m_socket.state() == QAbstractSocket::ConnectedState
+        && (!m_tlsSettings.enabled || m_socket.isEncrypted());
+}
+
+bool NetworkClient::isTlsEnabled() const
+{
+    return m_tlsSettings.enabled;
 }
 
 QString NetworkClient::host() const
@@ -189,7 +204,19 @@ void NetworkClient::sendReadReceipt(const QString& recipient, const QString& mes
     });
 }
 
-void NetworkClient::onConnected()
+void NetworkClient::onTcpConnected()
+{
+    if (!m_tlsSettings.enabled) {
+        onEncrypted();
+        return;
+    }
+
+    emit statusChanged(QStringLiteral("TCP connected. Negotiating TLS with %1:%2")
+                           .arg(m_transportState.host())
+                           .arg(m_transportState.port()));
+}
+
+void NetworkClient::onEncrypted()
 {
     m_reconnectTimer.stop();
     m_transportState.markConnected(nowMs());
@@ -197,7 +224,9 @@ void NetworkClient::onConnected()
     m_retryTimer.start();
 
     emit socketConnected();
-    emit statusChanged(QStringLiteral("Connected to %1:%2")
+    emit statusChanged((m_tlsSettings.enabled
+                            ? QStringLiteral("Secure connection established to %1:%2")
+                            : QStringLiteral("Connected to %1:%2"))
                            .arg(m_transportState.host())
                            .arg(m_transportState.port()));
 }
@@ -209,7 +238,8 @@ void NetworkClient::onDisconnected()
 
     emit socketDisconnected();
 
-    if (m_transportState.consumeManualDisconnect()) {
+    if (m_transportState.consumeManualDisconnect() || m_reconnectBlocked) {
+        m_reconnectBlocked = false;
         emit statusChanged(QStringLiteral("Disconnected"));
         return;
     }
@@ -247,9 +277,18 @@ void NetworkClient::onSocketError(QAbstractSocket::SocketError)
 {
     emit transportError(m_socket.errorString());
 
-    if (m_transportState.canReconnect() && m_socket.state() == QAbstractSocket::UnconnectedState) {
+    if (!m_reconnectBlocked
+        && m_transportState.canReconnect()
+        && m_socket.state() == QAbstractSocket::UnconnectedState) {
         scheduleReconnect();
     }
+}
+
+void NetworkClient::onSslErrors(const QList<QSslError>& errors)
+{
+    m_reconnectBlocked = true;
+    emit transportError(TlsConfiguration::sslErrorsToString(errors));
+    m_socket.abort();
 }
 
 void NetworkClient::sendPing()
@@ -289,6 +328,23 @@ void NetworkClient::reconnectIfNeeded()
 
 void NetworkClient::startConnectAttempt()
 {
+    if (m_tlsSettings.enabled) {
+        QString tlsError;
+        if (!TlsConfiguration::ensureTlsSupport(&tlsError)) {
+            m_reconnectBlocked = true;
+            emit transportError(tlsError);
+            return;
+        }
+
+        m_socket.setSslConfiguration(TlsConfiguration::makeClientSslConfiguration(m_tlsSettings));
+        m_socket.setPeerVerifyName(TlsConfiguration::peerVerifyName(m_tlsSettings, m_transportState.host()));
+        emit statusChanged(QStringLiteral("Connecting securely to %1:%2")
+                               .arg(m_transportState.host())
+                               .arg(m_transportState.port()));
+        m_socket.connectToHostEncrypted(m_transportState.host(), m_transportState.port());
+        return;
+    }
+
     emit statusChanged(QStringLiteral("Connecting to %1:%2")
                            .arg(m_transportState.host())
                            .arg(m_transportState.port()));
@@ -306,7 +362,9 @@ void NetworkClient::scheduleReconnect()
         return;
     }
     emit reconnectScheduled(delayMs);
-    emit statusChanged(QStringLiteral("Reconnecting to %1:%2 in %3 s")
+    emit statusChanged((m_tlsSettings.enabled
+                            ? QStringLiteral("Reconnecting securely to %1:%2 in %3 s")
+                            : QStringLiteral("Reconnecting to %1:%2 in %3 s"))
                            .arg(m_transportState.host())
                            .arg(m_transportState.port())
                            .arg((delayMs + 999) / 1000));

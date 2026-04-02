@@ -3,13 +3,15 @@
 #include <QObject>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QSslError>
+#include <QSslSocket>
 #include <QStringList>
-#include <QTcpSocket>
 #include <QTimer>
 
 #include "networkpacketdispatcher.h"
 #include "networktransportstate.h"
 #include "../Shared/authprotocol.h"
+#include "../Shared/tlsconfiguration.h"
 
 class NetworkClient : public QObject
 {
@@ -19,9 +21,11 @@ public:
     explicit NetworkClient(QObject* parent = nullptr);
     ~NetworkClient() override;
 
+    void setTlsConfiguration(const TlsConfiguration::ClientSettings& settings);
     void connectToServer(const QString& host, quint16 port);
     void disconnectFromServer();
     bool isConnected() const;
+    bool isTlsEnabled() const;
     QString host() const;
     quint16 port() const;
 
@@ -56,10 +60,12 @@ signals:
     void statusChanged(const QString& message);
 
 private slots:
-    void onConnected();
+    void onTcpConnected();
+    void onEncrypted();
     void onDisconnected();
     void onReadyRead();
     void onSocketError(QAbstractSocket::SocketError socketError);
+    void onSslErrors(const QList<QSslError>& errors);
     void sendPing();
     void retryPendingMessages();
     void reconnectIfNeeded();
@@ -73,11 +79,13 @@ private:
     void sendAck(const QString& id, quint32 seq);
     qint64 nowMs() const;
 
-    QTcpSocket m_socket;
+    QSslSocket m_socket;
     QTimer m_pingTimer;
     QTimer m_retryTimer;
     QTimer m_reconnectTimer;
     NetworkPacketDispatcher m_packetDispatcher;
     NetworkTransportState m_transportState;
+    TlsConfiguration::ClientSettings m_tlsSettings;
+    bool m_reconnectBlocked {false};
 };
 

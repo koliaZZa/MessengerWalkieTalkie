@@ -279,6 +279,49 @@ target_link_libraries(client_network_integration_tests
 
 add_test(NAME client_network_integration_tests COMMAND client_network_integration_tests)
 
+add_executable(tls_integration_tests
+    tls_integration_tests.cpp
+    ../Client/networkclient.cpp
+    ../Client/networkclient.h
+    ../Client/networkpacketdispatcher.cpp
+    ../Client/networkpacketdispatcher.h
+    ../Client/networktransportstate.cpp
+    ../Client/networktransportstate.h
+    ../Client/protocol.h
+    ../Server/server.cpp
+    ../Server/server.h
+    ../Server/connection.cpp
+    ../Server/connection.h
+    ../Server/worker.cpp
+    ../Server/worker.h
+    ../Server/authservice.cpp
+    ../Server/authservice.h
+    ../Server/ratelimiter.cpp
+    ../Server/ratelimiter.h
+    ../Server/logger.cpp
+    ../Server/logger.h
+    ../Server/tlstcpserver.h
+    ../Shared/authprotocol.h
+    ../Shared/tlsconfiguration.h
+    ../Shared/transportprotocol.h
+    tls_test_support.h
+)
+
+target_include_directories(tls_integration_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/Client
+    ${CMAKE_SOURCE_DIR}/Server
+    ${CMAKE_SOURCE_DIR}/Shared
+)
+
+target_link_libraries(tls_integration_tests
+    Qt6::Core
+    Qt6::Network
+    Qt6::Sql
+    Qt6::Test
+)
+
+add_test(NAME tls_integration_tests COMMAND tls_integration_tests)
+
 if (WIN32)
     add_custom_command(TARGET chat_window_integration_tests POST_BUILD
         COMMAND "${QT_WINDEPLOYQT_EXECUTABLE}"
@@ -297,6 +340,16 @@ if (WIN32)
             --no-translations
             "$<TARGET_FILE:client_network_integration_tests>"
         COMMENT "Deploying Qt runtime for client_network_integration_tests"
+        VERBATIM
+    )
+
+    add_custom_command(TARGET tls_integration_tests POST_BUILD
+        COMMAND "${QT_WINDEPLOYQT_EXECUTABLE}"
+            ${QT_WINDEPLOYQT_MODE}
+            --compiler-runtime
+            --no-translations
+            "$<TARGET_FILE:tls_integration_tests>"
+        COMMENT "Deploying Qt runtime for tls_integration_tests"
         VERBATIM
     )
 endif()

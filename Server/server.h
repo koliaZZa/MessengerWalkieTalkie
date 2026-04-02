@@ -4,11 +4,11 @@
 #include <QHash>
 #include <QJsonObject>
 #include <QMutex>
-#include <QTcpServer>
 #include <QVector>
 
 #include "authservice.h"
 #include "ratelimiter.h"
+#include "tlstcpserver.h"
 
 class Connection;
 class Worker;
@@ -23,6 +23,8 @@ public:
 
     bool start(quint16 port);
     void setDatabasePath(const QString& databasePath);
+    void setTlsConfiguration(const TlsConfiguration::ServerSettings& settings);
+    bool isTlsEnabled() const;
     quint16 listeningPort() const;
 
 private slots:
@@ -82,7 +84,7 @@ private:
     QString usernameFor(Connection* connection) const;
     void unregisterConnection(Connection* connection);
 
-    QTcpServer m_tcpServer;
+    TlsTcpServer m_tcpServer;
     QVector<Worker*> m_workers;
     int m_nextWorkerIndex {0};
 

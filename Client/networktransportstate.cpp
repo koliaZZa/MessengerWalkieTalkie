@@ -18,7 +18,7 @@ void NetworkTransportState::startConnection(const QString& host, quint16 port)
     m_reconnectEnabled = true;
     m_reconnectAttempt = 0;
     m_buffer.clear();
-    m_pendingMessages.clear();
+    m_trackedPackets.clear();
     m_nextOutgoingSeq = 0;
     m_lastIncomingSeq = 0;
     m_lastPongAtMs = 0;
@@ -28,7 +28,7 @@ void NetworkTransportState::prepareDisconnect()
 {
     m_manualDisconnect = true;
     m_reconnectEnabled = false;
-    m_pendingMessages.clear();
+    m_trackedPackets.clear();
     m_buffer.clear();
 }
 
@@ -108,49 +108,49 @@ void NetworkTransportState::markIncomingSequence(quint32 seq)
     }
 }
 
-void NetworkTransportState::trackReliableMessage(const QString& id, const QJsonObject& packet, qint64 nowMs)
+void NetworkTransportState::trackTrackedPacket(const QString& id, const QJsonObject& packet, qint64 nowMs)
 {
-    PendingClientMessage pending;
-    pending.payload = packet;
-    pending.retryAtMs = nowMs + kRetryScheduleMs[0];
-    m_pendingMessages.insert(id, pending);
+    TrackedClientPacket trackedPacket;
+    trackedPacket.payload = packet;
+    trackedPacket.retryAtMs = nowMs + kRetryScheduleMs[0];
+    m_trackedPackets.insert(id, trackedPacket);
 }
 
-void NetworkTransportState::acknowledgeReliableMessage(const QString& id)
+void NetworkTransportState::acknowledgeTrackedPacket(const QString& id)
 {
-    m_pendingMessages.remove(id);
+    m_trackedPackets.remove(id);
 }
 
-RetryActions NetworkTransportState::collectRetryActions(qint64 nowMs)
+TrackedRetryActions NetworkTransportState::collectTrackedRetryActions(qint64 nowMs)
 {
-    RetryActions actions;
+    TrackedRetryActions actions;
 
-    for (auto it = m_pendingMessages.begin(); it != m_pendingMessages.end();) {
-        PendingClientMessage& pending = it.value();
-        if (nowMs < pending.retryAtMs) {
+    for (auto it = m_trackedPackets.begin(); it != m_trackedPackets.end();) {
+        TrackedClientPacket& trackedPacket = it.value();
+        if (nowMs < trackedPacket.retryAtMs) {
             ++it;
             continue;
         }
 
-        if (pending.retries >= 5) {
+        if (trackedPacket.retries >= 5) {
             actions.droppedMessageIds.append(it.key());
-            it = m_pendingMessages.erase(it);
+            it = m_trackedPackets.erase(it);
             continue;
         }
 
-        const int delayIndex = qMin(pending.retries + 1, 4);
-        pending.retryAtMs = nowMs + kRetryScheduleMs[delayIndex];
-        ++pending.retries;
-        actions.resendPackets.append(pending.payload);
+        const int delayIndex = qMin(trackedPacket.retries + 1, 4);
+        trackedPacket.retryAtMs = nowMs + kRetryScheduleMs[delayIndex];
+        ++trackedPacket.retries;
+        actions.resendPackets.append(trackedPacket.payload);
         ++it;
     }
 
     return actions;
 }
 
-int NetworkTransportState::pendingReliableCount() const
+int NetworkTransportState::pendingTrackedCount() const
 {
-    return m_pendingMessages.size();
+    return m_trackedPackets.size();
 }
 
 qint64 NetworkTransportState::lastPongAtMs() const

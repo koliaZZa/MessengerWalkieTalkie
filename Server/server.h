@@ -3,11 +3,10 @@
 #include <QObject>
 #include <QHash>
 #include <QJsonObject>
-#include <QMutex>
 #include <QTcpServer>
 #include <QVector>
 
-#include "authservice.h"
+#include "serverstorage.h"
 #include "ratelimiter.h"
 
 class Connection;
@@ -29,13 +28,20 @@ private slots:
     void onNewConnection();
     void onConnectionReady(Connection* connection);
     void onPacketReceived(Connection* connection, const QJsonObject& packet);
-    void onReliablePacketAcked(Connection* connection, const QJsonObject& packet);
+    void onTrackedPacketAcknowledged(Connection* connection, const QJsonObject& packet);
     void onConnectionClosed(Connection* connection);
     void onAcceptError(QAbstractSocket::SocketError socketError);
 
 private:
+    enum class DeliveryMode {
+        Plain,
+        Tracked
+    };
+
     void stop();
-    void sendTo(Connection* connection, const QJsonObject& packet, bool reliable = false);
+    void sendTo(Connection* connection,
+                const QJsonObject& packet,
+                DeliveryMode deliveryMode = DeliveryMode::Plain);
     void sendAuthError(Connection* connection, const QString& errorMessage);
     bool canStartAuthenticatedSession(Connection* connection, const QString& username, QString& errorMessage) const;
     bool attachAuthenticatedSession(Connection* connection, const QString& username, QString& errorMessage);
@@ -86,14 +92,12 @@ private:
     QVector<Worker*> m_workers;
     int m_nextWorkerIndex {0};
 
-    mutable QMutex m_mutex;
     QHash<Connection*, QString> m_connectionUsers;
     QHash<QString, Connection*> m_onlineUsers;
-    QHash<Connection*, bool> m_allConnections;
 
     bool m_stopped {false};
 
-    AuthService m_authService;
+    ServerStorage m_storage;
     RateLimiter m_rateLimiter;
     QString m_databasePath {QStringLiteral("users.db")};
 };

@@ -1,4 +1,4 @@
-#include "authservice.h"
+#include "serverstorage.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -42,12 +42,12 @@ bool constantTimeEquals(const QByteArray& left, const QByteArray& right)
 
 }
 
-AuthService::AuthService(QObject* parent)
+ServerStorage::ServerStorage(QObject* parent)
     : QObject(parent)
 {
 }
 
-AuthService::~AuthService()
+ServerStorage::~ServerStorage()
 {
     if (m_database.isValid()) {
         const QString connectionName = m_connectionName;
@@ -57,13 +57,13 @@ AuthService::~AuthService()
     }
 }
 
-bool AuthService::init(const QString& databasePath)
+bool ServerStorage::init(const QString& databasePath)
 {
     if (m_database.isValid() && m_database.isOpen()) {
         return true;
     }
 
-    m_connectionName = QStringLiteral("auth_%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    m_connectionName = QStringLiteral("storage_%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
     m_database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), m_connectionName);
     if (databasePath.startsWith(QStringLiteral("file:"), Qt::CaseInsensitive)) {
         m_database.setConnectOptions(QStringLiteral("QSQLITE_OPEN_URI"));
@@ -81,10 +81,10 @@ bool AuthService::init(const QString& databasePath)
     return ensureSchema();
 }
 
-bool AuthService::registerUser(const QString& username,
-                               const QString& password,
-                               QString& errorMessage,
-                               AuthProtocol::SessionInfo* sessionInfo)
+bool ServerStorage::registerUser(const QString& username,
+                                 const QString& password,
+                                 QString& errorMessage,
+                                 AuthProtocol::SessionInfo* sessionInfo)
 {
     const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
     if (!isUsernameValid(normalizedUsername)) {
@@ -113,10 +113,10 @@ bool AuthService::registerUser(const QString& username,
     return issueSession(normalizedUsername, errorMessage, sessionInfo);
 }
 
-bool AuthService::loginUser(const QString& username,
-                            const QString& password,
-                            QString& errorMessage,
-                            AuthProtocol::SessionInfo* sessionInfo)
+bool ServerStorage::loginUser(const QString& username,
+                              const QString& password,
+                              QString& errorMessage,
+                              AuthProtocol::SessionInfo* sessionInfo)
 {
     const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
     QSqlQuery query(m_database);
@@ -142,10 +142,10 @@ bool AuthService::loginUser(const QString& username,
     return issueSession(normalizedUsername, errorMessage, sessionInfo);
 }
 
-bool AuthService::resumeSession(const QString& username,
-                                const QString& sessionToken,
-                                QString& errorMessage,
-                                AuthProtocol::SessionInfo* sessionInfo)
+bool ServerStorage::resumeSession(const QString& username,
+                                  const QString& sessionToken,
+                                  QString& errorMessage,
+                                  AuthProtocol::SessionInfo* sessionInfo)
 {
     const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
     if (normalizedUsername.isEmpty() || sessionToken.isEmpty()) {
@@ -188,7 +188,7 @@ bool AuthService::resumeSession(const QString& username,
     return issueSession(normalizedUsername, errorMessage, sessionInfo);
 }
 
-bool AuthService::invalidateSession(const QString& username)
+bool ServerStorage::invalidateSession(const QString& username)
 {
     const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
     if (normalizedUsername.isEmpty()) {
@@ -201,7 +201,7 @@ bool AuthService::invalidateSession(const QString& username)
     return query.exec();
 }
 
-bool AuthService::userExists(const QString& username) const
+bool ServerStorage::userExists(const QString& username) const
 {
     const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
     if (normalizedUsername.isEmpty()) {
@@ -218,46 +218,48 @@ bool AuthService::userExists(const QString& username) const
     return query.next();
 }
 
-bool AuthService::storeBroadcastMessage(const QString& id,
+bool ServerStorage::storeBroadcastMessage(const QString& id,
+                                          const QString& from,
+                                          const QString& text,
+                                          qint64 createdAt)
+{
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral(
+        "INSERT INTO broadcast_messages(id, from_user, text, created_at) "
+        "VALUES(?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "from_user = excluded.from_user, "
+        "text = excluded.text"));
+    query.addBindValue(id);
+    query.addBindValue(from);
+    query.addBindValue(text);
+    query.addBindValue(createdAt);
+    return query.exec();
+}
+
+bool ServerStorage::storePrivateMessage(const QString& id,
                                         const QString& from,
+                                        const QString& to,
                                         const QString& text,
                                         qint64 createdAt)
 {
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
-        "INSERT OR REPLACE INTO broadcast_messages(id, from_user, text, created_at) "
-        "VALUES(?, ?, ?, COALESCE((SELECT created_at FROM broadcast_messages WHERE id = ?), ?))"));
-    query.addBindValue(id);
-    query.addBindValue(from);
-    query.addBindValue(text);
-    query.addBindValue(id);
-    query.addBindValue(createdAt);
-    return query.exec();
-}
-
-bool AuthService::storePrivateMessage(const QString& id,
-                                      const QString& from,
-                                      const QString& to,
-                                      const QString& text,
-                                      qint64 createdAt)
-{
-    QSqlQuery query(m_database);
-    query.prepare(QStringLiteral(
-        "INSERT OR REPLACE INTO messages(id, from_user, to_user, text, created_at, delivered_at, read_at) "
-        "VALUES(?, ?, ?, ?, ?, "
-        "COALESCE((SELECT delivered_at FROM messages WHERE id = ?), NULL), "
-        "COALESCE((SELECT read_at FROM messages WHERE id = ?), NULL))"));
+        "INSERT INTO messages(id, from_user, to_user, text, created_at, delivered_at, read_at) "
+        "VALUES(?, ?, ?, ?, ?, NULL, NULL) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "from_user = excluded.from_user, "
+        "to_user = excluded.to_user, "
+        "text = excluded.text"));
     query.addBindValue(id);
     query.addBindValue(from);
     query.addBindValue(to);
     query.addBindValue(text);
     query.addBindValue(createdAt);
-    query.addBindValue(id);
-    query.addBindValue(id);
     return query.exec();
 }
 
-bool AuthService::markMessageDelivered(const QString& messageId, qint64 deliveredAtMs)
+bool ServerStorage::markMessageDelivered(const QString& messageId, qint64 deliveredAtMs)
 {
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral("UPDATE messages SET delivered_at = COALESCE(delivered_at, ?) WHERE id = ?"));
@@ -266,7 +268,7 @@ bool AuthService::markMessageDelivered(const QString& messageId, qint64 delivere
     return query.exec();
 }
 
-bool AuthService::markMessageRead(const QString& messageId, qint64 readAtMs)
+bool ServerStorage::markMessageRead(const QString& messageId, qint64 readAtMs)
 {
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
@@ -279,7 +281,7 @@ bool AuthService::markMessageRead(const QString& messageId, qint64 readAtMs)
     return query.exec();
 }
 
-QStringList AuthService::loadDialogUsers(const QString& username) const
+QStringList ServerStorage::loadDialogUsers(const QString& username) const
 {
     QStringList dialogs;
     QSqlQuery query(m_database);
@@ -305,7 +307,7 @@ QStringList AuthService::loadDialogUsers(const QString& username) const
     return dialogs;
 }
 
-QList<HistoryMessageRecord> AuthService::loadBroadcastHistory(int limit) const
+QList<HistoryMessageRecord> ServerStorage::loadBroadcastHistory(int limit) const
 {
     QList<HistoryMessageRecord> messages;
     QSqlQuery query(m_database);
@@ -336,9 +338,9 @@ QList<HistoryMessageRecord> AuthService::loadBroadcastHistory(int limit) const
     return messages;
 }
 
-QList<HistoryMessageRecord> AuthService::loadPrivateHistory(const QString& username,
-                                                            const QString& otherUsername,
-                                                            int limit) const
+QList<HistoryMessageRecord> ServerStorage::loadPrivateHistory(const QString& username,
+                                                              const QString& otherUsername,
+                                                              int limit) const
 {
     QList<HistoryMessageRecord> messages;
     QSqlQuery query(m_database);
@@ -379,7 +381,7 @@ QList<HistoryMessageRecord> AuthService::loadPrivateHistory(const QString& usern
     return messages;
 }
 
-QList<PendingPrivateMessageRecord> AuthService::loadPendingPrivateMessages(const QString& username) const
+QList<PendingPrivateMessageRecord> ServerStorage::loadPendingPrivateMessages(const QString& username) const
 {
     QList<PendingPrivateMessageRecord> messages;
     QSqlQuery query(m_database);
@@ -407,7 +409,7 @@ QList<PendingPrivateMessageRecord> AuthService::loadPendingPrivateMessages(const
     return messages;
 }
 
-bool AuthService::ensureSchema()
+bool ServerStorage::ensureSchema()
 {
     QSqlQuery query(m_database);
     const QStringList statements{
@@ -460,7 +462,7 @@ bool AuthService::ensureSchema()
     return true;
 }
 
-QString AuthService::hashPassword(const QString& password) const
+QString ServerStorage::hashPassword(const QString& password) const
 {
     const QByteArray salt = randomBytes(kPasswordSaltBytes);
     const QByteArray derived = derivePbkdf2(password.toUtf8(), salt, kPbkdf2Iterations, kPbkdf2KeyLength);
@@ -471,7 +473,7 @@ QString AuthService::hashPassword(const QString& password) const
         .arg(QString::fromUtf8(derived.toHex()));
 }
 
-bool AuthService::verifyPassword(const QString& password, const QString& storedHash) const
+bool ServerStorage::verifyPassword(const QString& password, const QString& storedHash) const
 {
     const QStringList parts = storedHash.split(QStringLiteral("$"));
     if (parts.size() != 4 || parts.constFirst() != QString::fromLatin1(kPbkdf2Prefix)) {
@@ -490,7 +492,7 @@ bool AuthService::verifyPassword(const QString& password, const QString& storedH
     return constantTimeEquals(actual, expected);
 }
 
-QByteArray AuthService::randomBytes(int count) const
+QByteArray ServerStorage::randomBytes(int count) const
 {
     QByteArray bytes(count, '\0');
     for (int index = 0; index < count; ++index) {
@@ -499,7 +501,7 @@ QByteArray AuthService::randomBytes(int count) const
     return bytes;
 }
 
-QByteArray AuthService::hmacSha256(const QByteArray& key, const QByteArray& message) const
+QByteArray ServerStorage::hmacSha256(const QByteArray& key, const QByteArray& message) const
 {
     QByteArray normalizedKey = key;
     if (normalizedKey.size() > kHmacBlockSize) {
@@ -525,10 +527,10 @@ QByteArray AuthService::hmacSha256(const QByteArray& key, const QByteArray& mess
     return QCryptographicHash::hash(outerInput, QCryptographicHash::Sha256);
 }
 
-QByteArray AuthService::derivePbkdf2(const QByteArray& password,
-                                     const QByteArray& salt,
-                                     int iterations,
-                                     int keyLength) const
+QByteArray ServerStorage::derivePbkdf2(const QByteArray& password,
+                                       const QByteArray& salt,
+                                       int iterations,
+                                       int keyLength) const
 {
     QByteArray derived;
     quint32 blockIndex = 1;
@@ -553,19 +555,19 @@ QByteArray AuthService::derivePbkdf2(const QByteArray& password,
     return derived;
 }
 
-QString AuthService::generateSessionToken() const
+QString ServerStorage::generateSessionToken() const
 {
     return QString::fromUtf8(randomBytes(AuthProtocol::kSessionTokenBytes).toHex());
 }
 
-QString AuthService::hashSessionToken(const QString& sessionToken) const
+QString ServerStorage::hashSessionToken(const QString& sessionToken) const
 {
     return QString::fromUtf8(QCryptographicHash::hash(sessionToken.toUtf8(), QCryptographicHash::Sha256).toHex());
 }
 
-bool AuthService::issueSession(const QString& username,
-                               QString& errorMessage,
-                               AuthProtocol::SessionInfo* sessionInfo)
+bool ServerStorage::issueSession(const QString& username,
+                                 QString& errorMessage,
+                                 AuthProtocol::SessionInfo* sessionInfo)
 {
     const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
     if (normalizedUsername.isEmpty()) {
@@ -598,7 +600,7 @@ bool AuthService::issueSession(const QString& username,
     return true;
 }
 
-bool AuthService::removeExpiredSession(const QString& username)
+bool ServerStorage::removeExpiredSession(const QString& username)
 {
     const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
     if (normalizedUsername.isEmpty()) {
@@ -613,7 +615,7 @@ bool AuthService::removeExpiredSession(const QString& username)
     return query.exec();
 }
 
-bool AuthService::isUsernameValid(const QString& username) const
+bool ServerStorage::isUsernameValid(const QString& username) const
 {
     return AuthProtocol::isAsciiUsernameValid(AuthProtocol::normalizeUsername(username));
 }

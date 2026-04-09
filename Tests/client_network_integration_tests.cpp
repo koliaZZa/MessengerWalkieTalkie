@@ -1,14 +1,19 @@
 #include <memory>
 
 #include <QCoreApplication>
+#include <QDataStream>
 #include <QElapsedTimer>
+#include <QHostAddress>
 #include <QSignalSpy>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QTemporaryDir>
 #include <QTest>
 
 #include "sqlite_test_support.h"
 #include "../Client/networkclient.h"
 #include "../Server/server.h"
+#include "../Shared/transportprotocol.h"
 
 namespace {
 
@@ -26,6 +31,16 @@ bool waitForCount(QSignalSpy& spy, int expectedCount, int timeoutMs = 5000)
     }
 
     return spy.count() >= expectedCount;
+}
+
+QByteArray invalidLengthPacketBytes()
+{
+    QByteArray bytes;
+    QDataStream stream(&bytes, QIODevice::WriteOnly);
+    stream.setVersion(QDataStream::Qt_6_0);
+    stream << static_cast<quint32>(Protocol::kMaxPayloadSize + 1);
+    bytes.append(QByteArray(Protocol::kFooterSize, '\0'));
+    return bytes;
 }
 
 std::unique_ptr<Server> startServerWithRetry(const QString& databasePath,
@@ -59,6 +74,7 @@ private slots:
     void initTestCase();
     void queuedPrivateHistoryAndReadFlow();
     void reconnectAndResumeAfterServerRestart();
+    void invalidPacketDisconnectsClient();
 };
 
 void ClientNetworkIntegrationTests::initTestCase()
@@ -193,6 +209,35 @@ void ClientNetworkIntegrationTests::reconnectAndResumeAfterServerRestart()
     QVERIFY(waitForCount(authSpy, 2));
     QCOMPARE(authSpy.at(1).at(0).toString(), QStringLiteral("reconnect_user"));
     QVERIFY(authSpy.at(1).at(1).toString() != sessionToken);
+
+    client.disconnectFromServer();
+}
+
+void ClientNetworkIntegrationTests::invalidPacketDisconnectsClient()
+{
+    QTcpServer badServer;
+    QVERIFY(badServer.listen(QHostAddress::LocalHost, 0));
+
+    connect(&badServer, &QTcpServer::newConnection, &badServer, [&badServer]() {
+        QTcpSocket* socket = badServer.nextPendingConnection();
+        if (!socket) {
+            return;
+        }
+
+        socket->write(invalidLengthPacketBytes());
+        socket->flush();
+    });
+
+    NetworkClient client;
+    QSignalSpy connectedSpy(&client, &NetworkClient::socketConnected);
+    QSignalSpy disconnectedSpy(&client, &NetworkClient::socketDisconnected);
+    QSignalSpy errorSpy(&client, &NetworkClient::transportError);
+
+    client.connectToServer(QStringLiteral("127.0.0.1"), badServer.serverPort());
+    QVERIFY(waitForCount(connectedSpy, 1));
+    QVERIFY(waitForCount(errorSpy, 1));
+    QCOMPARE(errorSpy.at(0).at(0).toString(), QStringLiteral("Invalid packet"));
+    QVERIFY(waitForCount(disconnectedSpy, 1));
 
     client.disconnectFromServer();
 }

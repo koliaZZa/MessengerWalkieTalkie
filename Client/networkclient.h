@@ -67,8 +67,8 @@ private slots:
 private:
     void startConnectAttempt();
     void scheduleReconnect();
-    void sendUnreliable(const QJsonObject& packet);
-    QString sendReliable(QJsonObject packet);
+    void sendPlain(const QJsonObject& packet);
+    QString sendTracked(QJsonObject packet);
     void processPacket(const QJsonObject& packet);
     void sendAck(const QString& id, quint32 seq);
     qint64 nowMs() const;

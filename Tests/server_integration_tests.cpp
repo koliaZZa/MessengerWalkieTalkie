@@ -1,8 +1,10 @@
 #include <functional>
 
 #include <QCoreApplication>
+#include <QDataStream>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QTcpSocket>
 #include <QTest>
@@ -18,6 +20,16 @@ namespace {
 QString uniqueId()
 {
     return QUuid::createUuid().toString(QUuid::WithoutBraces);
+}
+
+QByteArray invalidLengthPacketBytes()
+{
+    QByteArray bytes;
+    QDataStream stream(&bytes, QIODevice::WriteOnly);
+    stream.setVersion(QDataStream::Qt_6_0);
+    stream << static_cast<quint32>(Protocol::kMaxPayloadSize + 1);
+    bytes.append(QByteArray(Protocol::kFooterSize, '\0'));
+    return bytes;
 }
 
 class TestSocketClient
@@ -69,7 +81,15 @@ public:
         return ok;
     }
 
-    QString sendReliable(QJsonObject packet)
+    bool sendRaw(const QByteArray& bytes)
+    {
+        const qint64 written = m_socket.write(bytes);
+        m_socket.flush();
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        return written == bytes.size();
+    }
+
+    QString sendTracked(QJsonObject packet)
     {
         QString id = packet.value(QStringLiteral("id")).toString();
         if (id.isEmpty()) {
@@ -86,6 +106,22 @@ public:
     {
         return waitForPacket([&](const QJsonObject& packet) {
             return packet.value(QStringLiteral("type")).toString() == type;
+        }, outPacket, timeoutMs);
+    }
+
+    bool waitForUsersList(const QStringList& expectedUsers, QJsonObject* outPacket = nullptr, int timeoutMs = 5000)
+    {
+        return waitForPacket([&](const QJsonObject& packet) {
+            if (packet.value(QStringLiteral("type")).toString() != QStringLiteral("users")) {
+                return false;
+            }
+
+            QStringList actualUsers;
+            const QJsonArray values = packet.value(QStringLiteral("list")).toArray();
+            for (auto value : values) {
+                actualUsers.append(value.toString());
+            }
+            return actualUsers == expectedUsers;
         }, outPacket, timeoutMs);
     }
 
@@ -172,6 +208,7 @@ private slots:
     void registerResumeAndLogoutFlow();
     void offlinePrivateDeliveryAndReadFlow();
     void loginRateLimitBlocksRepeatedAttempts();
+    void invalidLengthPacketClosesConnection();
 };
 
 void ServerIntegrationTests::initTestCase()
@@ -261,7 +298,10 @@ void ServerIntegrationTests::offlinePrivateDeliveryAndReadFlow()
 
     bobClient.disconnect();
 
-    const QString messageId = aliceClient.sendReliable({
+    QJsonObject usersPacket;
+    QVERIFY(aliceClient.waitForUsersList(QStringList({QStringLiteral("alice")}), &usersPacket));
+
+    const QString messageId = aliceClient.sendTracked({
         {QStringLiteral("type"), QStringLiteral("private")},
         {QStringLiteral("to"), QStringLiteral("bob")},
         {QStringLiteral("text"), QStringLiteral("queued hello")}
@@ -350,6 +390,19 @@ void ServerIntegrationTests::loginRateLimitBlocksRepeatedAttempts()
     QJsonObject limitedPacket;
     QVERIFY(attackerClient.waitForPacketType(QString::fromLatin1(AuthProtocol::kTypeAuthError), &limitedPacket));
     QVERIFY(limitedPacket.value(AuthProtocol::kFieldMessage).toString().contains(QStringLiteral("Too many login attempts")));
+}
+
+void ServerIntegrationTests::invalidLengthPacketClosesConnection()
+{
+    Server server;
+    server.setDatabasePath(TestSupport::sharedMemoryDatabaseUri(QStringLiteral("integration_invalid_packet")));
+    QVERIFY(server.start(0));
+    QVERIFY(server.listeningPort() > 0);
+
+    TestSocketClient client;
+    QVERIFY(client.connectTo(server.listeningPort()));
+    QVERIFY(client.sendRaw(invalidLengthPacketBytes()));
+    QVERIFY(client.waitForDisconnected());
 }
 
 int main(int argc, char* argv[])

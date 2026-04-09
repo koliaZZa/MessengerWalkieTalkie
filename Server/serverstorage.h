@@ -24,13 +24,13 @@ struct PendingPrivateMessageRecord {
     qint64 createdAt = 0;
 };
 
-class AuthService : public QObject
+class ServerStorage : public QObject
 {
     Q_OBJECT
 
 public:
-    explicit AuthService(QObject* parent = nullptr);
-    ~AuthService() override;
+    explicit ServerStorage(QObject* parent = nullptr);
+    ~ServerStorage() override;
 
     bool init(const QString& databasePath = QStringLiteral("users.db"));
     bool registerUser(const QString& username,

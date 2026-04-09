@@ -17,8 +17,8 @@ add_executable(server
     connection.h
     worker.cpp
     worker.h
-    authservice.cpp
-    authservice.h
+    serverstorage.cpp
+    serverstorage.h
     ratelimiter.cpp
     ratelimiter.h
     logger.cpp

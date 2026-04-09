@@ -6,8 +6,8 @@ find_package(Qt6 REQUIRED COMPONENTS Core Network Sql Test Widgets)
 
 add_executable(server_security_tests
     server_security_tests.cpp
-    ../Server/authservice.cpp
-    ../Server/authservice.h
+    ../Server/serverstorage.cpp
+    ../Server/serverstorage.h
     ../Server/ratelimiter.cpp
     ../Server/ratelimiter.h
     ../Shared/authprotocol.h
@@ -51,8 +51,8 @@ add_executable(server_integration_tests
     ../Server/connection.h
     ../Server/worker.cpp
     ../Server/worker.h
-    ../Server/authservice.cpp
-    ../Server/authservice.h
+    ../Server/serverstorage.cpp
+    ../Server/serverstorage.h
     ../Server/ratelimiter.cpp
     ../Server/ratelimiter.h
     ../Server/logger.cpp
@@ -157,8 +157,8 @@ add_executable(chat_window_integration_tests
     ../Server/connection.h
     ../Server/worker.cpp
     ../Server/worker.h
-    ../Server/authservice.cpp
-    ../Server/authservice.h
+    ../Server/serverstorage.cpp
+    ../Server/serverstorage.h
     ../Server/ratelimiter.cpp
     ../Server/ratelimiter.h
     ../Server/logger.cpp
@@ -254,8 +254,8 @@ add_executable(client_network_integration_tests
     ../Server/connection.h
     ../Server/worker.cpp
     ../Server/worker.h
-    ../Server/authservice.cpp
-    ../Server/authservice.h
+    ../Server/serverstorage.cpp
+    ../Server/serverstorage.h
     ../Server/ratelimiter.cpp
     ../Server/ratelimiter.h
     ../Server/logger.cpp
@@ -330,8 +330,8 @@ add_executable(client_flow_controller_integration_tests
     ../Server/connection.h
     ../Server/worker.cpp
     ../Server/worker.h
-    ../Server/authservice.cpp
-    ../Server/authservice.h
+    ../Server/serverstorage.cpp
+    ../Server/serverstorage.h
     ../Server/ratelimiter.cpp
     ../Server/ratelimiter.h
     ../Server/logger.cpp

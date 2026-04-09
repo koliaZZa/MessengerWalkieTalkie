@@ -113,13 +113,13 @@ void NetworkClient::login(const QString& username, const QString& password)
         {"supports_history", true}
     };
 
-    sendUnreliable(packet);
+    sendPlain(packet);
 }
 
 void NetworkClient::registerUser(const QString& username, const QString& password)
 {
     const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
-    sendUnreliable({
+    sendPlain({
         {AuthProtocol::kFieldType, QString::fromLatin1(AuthProtocol::kTypeRegister)},
         {AuthProtocol::kFieldUsername, normalizedUsername},
         {AuthProtocol::kFieldPassword, password}
@@ -129,13 +129,13 @@ void NetworkClient::registerUser(const QString& username, const QString& passwor
 void NetworkClient::resumeSession(const QString& username, const QString& sessionToken)
 {
     const QString normalizedUsername = AuthProtocol::normalizeUsername(username);
-    sendUnreliable(AuthProtocol::makeResumeSessionPacket(normalizedUsername, sessionToken));
+    sendPlain(AuthProtocol::makeResumeSessionPacket(normalizedUsername, sessionToken));
 }
 
 void NetworkClient::logout()
 {
     if (m_socket.state() == QAbstractSocket::ConnectedState) {
-        sendUnreliable(AuthProtocol::makeLogoutPacket());
+        sendPlain(AuthProtocol::makeLogoutPacket());
         m_socket.flush();
         m_socket.waitForBytesWritten(500);
     }
@@ -143,7 +143,7 @@ void NetworkClient::logout()
 
 void NetworkClient::checkUserExists(const QString& username)
 {
-    sendUnreliable({
+    sendPlain({
         {"type", "check_user"},
         {"username", AuthProtocol::normalizeUsername(username)}
     });
@@ -151,12 +151,12 @@ void NetworkClient::checkUserExists(const QString& username)
 
 void NetworkClient::requestDialogList()
 {
-    sendUnreliable({{"type", "dialogs"}});
+    sendPlain({{"type", "dialogs"}});
 }
 
 void NetworkClient::requestHistory(const QString& chatUser, int limit)
 {
-    sendUnreliable({
+    sendPlain({
         {"type", "history"},
         {"with", chatUser},
         {"limit", qBound(1, limit, 200)}
@@ -165,7 +165,7 @@ void NetworkClient::requestHistory(const QString& chatUser, int limit)
 
 QString NetworkClient::sendBroadcastMessage(const QString& text)
 {
-    return sendReliable({
+    return sendTracked({
         {"type", "message"},
         {"text", text}
     });
@@ -173,7 +173,7 @@ QString NetworkClient::sendBroadcastMessage(const QString& text)
 
 QString NetworkClient::sendPrivateMessage(const QString& recipient, const QString& text)
 {
-    return sendReliable({
+    return sendTracked({
         {"type", "private"},
         {"to", recipient},
         {"text", text}
@@ -182,7 +182,7 @@ QString NetworkClient::sendPrivateMessage(const QString& recipient, const QStrin
 
 void NetworkClient::sendReadReceipt(const QString& recipient, const QString& messageId)
 {
-    sendUnreliable({
+    sendPlain({
         {"type", "read"},
         {"to", recipient},
         {"id", messageId}
@@ -234,8 +234,14 @@ void NetworkClient::onReadyRead()
             continue;
         }
 
-        if (status == Protocol::DecodeStatus::InvalidJson || status == Protocol::DecodeStatus::InvalidPacket) {
+        if (status == Protocol::DecodeStatus::InvalidPacket) {
             emit transportError(QStringLiteral("Invalid packet"));
+            m_socket.abort();
+            return;
+        }
+
+        if (status == Protocol::DecodeStatus::InvalidJson) {
+            emit transportError(QStringLiteral("Invalid JSON packet"));
             continue;
         }
 
@@ -254,20 +260,20 @@ void NetworkClient::onSocketError(QAbstractSocket::SocketError)
 
 void NetworkClient::sendPing()
 {
-    sendUnreliable({{"type", "ping"}});
+    sendPlain({{"type", "ping"}});
 }
 
 void NetworkClient::retryPendingMessages()
 {
     const qint64 currentMs = nowMs();
-    const RetryActions actions = m_transportState.collectRetryActions(currentMs);
+    const TrackedRetryActions actions = m_transportState.collectTrackedRetryActions(currentMs);
 
     for (auto droppedId : actions.droppedMessageIds) {
         emit transportError(QStringLiteral("Message dropped after retries: %1").arg(droppedId));
     }
 
     for (auto packet : actions.resendPackets) {
-        sendUnreliable(packet);
+        sendPlain(packet);
     }
 
     if (m_socket.state() == QAbstractSocket::ConnectedState && m_transportState.isHeartbeatExpired(currentMs)) {
@@ -313,12 +319,12 @@ void NetworkClient::scheduleReconnect()
     m_reconnectTimer.start(delayMs);
 }
 
-void NetworkClient::sendUnreliable(const QJsonObject& packet)
+void NetworkClient::sendPlain(const QJsonObject& packet)
 {
     Protocol::writePacket(&m_socket, packet);
 }
 
-QString NetworkClient::sendReliable(QJsonObject packet)
+QString NetworkClient::sendTracked(QJsonObject packet)
 {
     QString id = packet.value("id").toString();
     if (id.isEmpty()) {
@@ -326,10 +332,11 @@ QString NetworkClient::sendReliable(QJsonObject packet)
         packet["id"] = id;
     }
 
+    // This is app-level delivery tracking/deduplication on top of TCP.
     packet["seq"] = static_cast<qint64>(m_transportState.nextOutgoingSequence());
-    m_transportState.trackReliableMessage(id, packet, nowMs());
+    m_transportState.trackTrackedPacket(id, packet, nowMs());
 
-    sendUnreliable(packet);
+    sendPlain(packet);
     return id;
 }
 
@@ -338,7 +345,7 @@ void NetworkClient::processPacket(const QJsonObject& packet)
     const QString type = packet.value("type").toString();
 
     if (type == "ack") {
-        m_transportState.acknowledgeReliableMessage(packet.value("id").toString());
+        m_transportState.acknowledgeTrackedPacket(packet.value("id").toString());
         return;
     }
 
@@ -348,7 +355,7 @@ void NetworkClient::processPacket(const QJsonObject& packet)
     }
 
     if (type == "ping") {
-        sendUnreliable({{"type", "pong"}});
+        sendPlain({{"type", "pong"}});
         return;
     }
 
@@ -376,7 +383,7 @@ void NetworkClient::sendAck(const QString& id, quint32 seq)
         return;
     }
 
-    sendUnreliable({
+    sendPlain({
         {"type", "ack"},
         {"id", id},
         {"seq", static_cast<qint64>(seq)}

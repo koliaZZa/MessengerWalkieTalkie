@@ -7,7 +7,7 @@
 #include <QTimer>
 #include <QTcpSocket>
 
-struct PendingMessage {
+struct TrackedPendingMessage {
     QJsonObject payload;
     int retries = 0;
     qint64 retryAtMs = 0;
@@ -25,14 +25,15 @@ public:
 
 signals:
     void packetReceived(Connection* connection, const QJsonObject& packet);
-    void reliablePacketAcked(Connection* connection, const QJsonObject& packet);
+    void trackedPacketAcknowledged(Connection* connection, const QJsonObject& packet);
     void closed(Connection* connection);
 
 public slots:
     void start();
-    void sendUnreliable(const QJsonObject& packet);
-    void sendReliable(QJsonObject packet);
+    void sendPlain(const QJsonObject& packet);
+    void sendTracked(QJsonObject packet);
     void closeConnection();
+    void closeAndNotify();
 
 private slots:
     void onReadyRead();
@@ -44,16 +45,18 @@ private slots:
 private:
     void processIncomingPacket(const QJsonObject& packet);
     void sendAck(const QString& messageId, quint32 seq);
+    void notifyClosedOnce();
     qint64 nowMs() const;
 
     QTcpSocket* m_socket {nullptr};
     QByteArray m_buffer;
-    QHash<QString, PendingMessage> m_pendingMessages;
+    QHash<QString, TrackedPendingMessage> m_trackedMessages;
     QTimer m_retryTimer;
     QTimer m_pingTimer;
     quint32 m_nextOutgoingSeq {0};
     quint32 m_lastIncomingSeq {0};
     qint64 m_lastPongAtMs {0};
+    bool m_closedNotified {false};
 };
 
 Q_DECLARE_METATYPE(Connection*)

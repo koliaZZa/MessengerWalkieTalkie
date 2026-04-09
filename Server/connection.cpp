@@ -55,7 +55,7 @@ void Connection::start()
                            QStringLiteral("Client connected from %1").arg(peerAddress()));
 }
 
-void Connection::sendUnreliable(const QJsonObject& packet)
+void Connection::sendPlain(const QJsonObject& packet)
 {
     if (!m_socket || m_socket->state() != QAbstractSocket::ConnectedState) {
         return;
@@ -64,7 +64,7 @@ void Connection::sendUnreliable(const QJsonObject& packet)
     Protocol::writePacket(m_socket, packet);
 }
 
-void Connection::sendReliable(QJsonObject packet)
+void Connection::sendTracked(QJsonObject packet)
 {
     QString messageId = packet.value("id").toString();
     if (messageId.isEmpty()) {
@@ -74,12 +74,13 @@ void Connection::sendReliable(QJsonObject packet)
 
     packet["seq"] = static_cast<qint64>(++m_nextOutgoingSeq);
 
-    PendingMessage pending;
-    pending.payload = packet;
-    pending.retryAtMs = nowMs() + kRetryScheduleMs[0];
-    m_pendingMessages.insert(messageId, pending);
+    // This is app-level delivery tracking/deduplication on top of TCP.
+    TrackedPendingMessage pendingMessage;
+    pendingMessage.payload = packet;
+    pendingMessage.retryAtMs = nowMs() + kRetryScheduleMs[0];
+    m_trackedMessages.insert(messageId, pendingMessage);
 
-    sendUnreliable(packet);
+    sendPlain(packet);
 }
 
 void Connection::closeConnection()
@@ -104,6 +105,12 @@ void Connection::closeConnection()
     m_socket = nullptr;
 }
 
+void Connection::closeAndNotify()
+{
+    closeConnection();
+    notifyClosedOnce();
+}
+
 void Connection::onReadyRead()
 {
     if (!m_socket) {
@@ -125,9 +132,16 @@ void Connection::onReadyRead()
             continue;
         }
 
-        if (status == Protocol::DecodeStatus::InvalidJson || status == Protocol::DecodeStatus::InvalidPacket) {
+        if (status == Protocol::DecodeStatus::InvalidPacket) {
             Logger::instance().log(LogLevel::Error,
-                                   QStringLiteral("Invalid packet from %1").arg(peerAddress()));
+                                   QStringLiteral("Invalid packet from %1, closing connection").arg(peerAddress()));
+            closeAndNotify();
+            return;
+        }
+
+        if (status == Protocol::DecodeStatus::InvalidJson) {
+            Logger::instance().log(LogLevel::Error,
+                                   QStringLiteral("Invalid JSON packet from %1").arg(peerAddress()));
             continue;
         }
 
@@ -139,7 +153,7 @@ void Connection::onSocketDisconnected()
 {
     Logger::instance().log(LogLevel::Warning,
                            QStringLiteral("Client disconnected: %1").arg(peerAddress()));
-    emit closed(this);
+    notifyClosedOnce();
 }
 
 void Connection::onSocketError(QAbstractSocket::SocketError)
@@ -157,43 +171,42 @@ void Connection::checkPendingMessages()
 {
     const qint64 currentMs = nowMs();
 
-    for (auto it = m_pendingMessages.begin(); it != m_pendingMessages.end();) {
-        PendingMessage& pending = it.value();
-        if (currentMs < pending.retryAtMs) {
+    for (auto it = m_trackedMessages.begin(); it != m_trackedMessages.end();) {
+        TrackedPendingMessage& pendingMessage = it.value();
+        if (currentMs < pendingMessage.retryAtMs) {
             ++it;
             continue;
         }
 
-        if (pending.retries >= 5) {
+        if (pendingMessage.retries >= 5) {
             Logger::instance().log(LogLevel::Warning,
                                    QStringLiteral("Drop message after retries: %1").arg(it.key()));
-            it = m_pendingMessages.erase(it);
+            it = m_trackedMessages.erase(it);
             continue;
         }
 
-        const int delayIndex = qMin(pending.retries + 1, 4);
-        pending.retryAtMs = currentMs + kRetryScheduleMs[delayIndex];
-        ++pending.retries;
+        const int delayIndex = qMin(pendingMessage.retries + 1, 4);
+        pendingMessage.retryAtMs = currentMs + kRetryScheduleMs[delayIndex];
+        ++pendingMessage.retries;
 
         Logger::instance().log(LogLevel::Warning,
                                QStringLiteral("Retry message %1 attempt %2")
                                    .arg(it.key())
-                                   .arg(pending.retries));
-        sendUnreliable(pending.payload);
+                                   .arg(pendingMessage.retries));
+        sendPlain(pendingMessage.payload);
         ++it;
     }
 
     if (currentMs - m_lastPongAtMs > kPongTimeoutMs) {
         Logger::instance().log(LogLevel::Warning,
                                QStringLiteral("Heartbeat timeout from %1").arg(peerAddress()));
-        closeConnection();
-        emit closed(this);
+        closeAndNotify();
     }
 }
 
 void Connection::sendPing()
 {
-    sendUnreliable({{"type", "ping"}});
+    sendPlain({{"type", "ping"}});
 }
 
 void Connection::processIncomingPacket(const QJsonObject& packet)
@@ -202,10 +215,10 @@ void Connection::processIncomingPacket(const QJsonObject& packet)
 
     if (type == "ack") {
         const QString messageId = packet.value("id").toString();
-        const auto it = m_pendingMessages.find(messageId);
-        if (it != m_pendingMessages.end()) {
-            emit reliablePacketAcked(this, it.value().payload);
-            m_pendingMessages.erase(it);
+        const auto it = m_trackedMessages.find(messageId);
+        if (it != m_trackedMessages.end()) {
+            emit trackedPacketAcknowledged(this, it.value().payload);
+            m_trackedMessages.erase(it);
         }
         return;
     }
@@ -216,7 +229,7 @@ void Connection::processIncomingPacket(const QJsonObject& packet)
     }
 
     if (type == "ping") {
-        sendUnreliable({{"type", "pong"}});
+        sendPlain({{"type", "pong"}});
         return;
     }
 
@@ -241,7 +254,7 @@ void Connection::sendAck(const QString& messageId, quint32 seq)
         return;
     }
 
-    sendUnreliable({
+    sendPlain({
         {"type", "ack"},
         {"id", messageId},
         {"seq", static_cast<qint64>(seq)}
@@ -251,4 +264,14 @@ void Connection::sendAck(const QString& messageId, quint32 seq)
 qint64 Connection::nowMs() const
 {
     return QDateTime::currentMSecsSinceEpoch();
+}
+
+void Connection::notifyClosedOnce()
+{
+    if (m_closedNotified) {
+        return;
+    }
+
+    m_closedNotified = true;
+    emit closed(this);
 }

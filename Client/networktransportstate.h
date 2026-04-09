@@ -6,13 +6,13 @@
 #include <QList>
 #include <QStringList>
 
-struct PendingClientMessage {
+struct TrackedClientPacket {
     QJsonObject payload;
     int retries = 0;
     qint64 retryAtMs = 0;
 };
 
-struct RetryActions {
+struct TrackedRetryActions {
     QList<QJsonObject> resendPackets;
     QStringList droppedMessageIds;
 };
@@ -38,11 +38,11 @@ public:
     bool isDuplicateIncomingSequence(quint32 seq) const;
     void markIncomingSequence(quint32 seq);
 
-    void trackReliableMessage(const QString& id, const QJsonObject& packet, qint64 nowMs);
-    void acknowledgeReliableMessage(const QString& id);
-    RetryActions collectRetryActions(qint64 nowMs);
+    void trackTrackedPacket(const QString& id, const QJsonObject& packet, qint64 nowMs);
+    void acknowledgeTrackedPacket(const QString& id);
+    TrackedRetryActions collectTrackedRetryActions(qint64 nowMs);
 
-    int pendingReliableCount() const;
+    int pendingTrackedCount() const;
     qint64 lastPongAtMs() const;
 
 private:
@@ -50,7 +50,7 @@ private:
     static quint16 normalizedPort(quint16 port);
 
     QByteArray m_buffer;
-    QHash<QString, PendingClientMessage> m_pendingMessages;
+    QHash<QString, TrackedClientPacket> m_trackedPackets;
     quint32 m_nextOutgoingSeq {0};
     quint32 m_lastIncomingSeq {0};
     qint64 m_lastPongAtMs {0};

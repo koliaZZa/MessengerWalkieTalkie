@@ -21,16 +21,9 @@ int main(int argc, char* argv[])
                                   QStringLiteral("port"),
                                   QStringLiteral("5555"));
     parser.addOption(portOption);
-    parser.addPositionalArgument(QStringLiteral("port"),
-                                 QStringLiteral("Listen port. If specified, overrides the default 5555."));
     parser.process(application);
 
-    QString portText = parser.value(portOption).trimmed();
-    const QStringList positionalArguments = parser.positionalArguments();
-    if (!positionalArguments.isEmpty() && !parser.isSet(portOption)) {
-        portText = positionalArguments.constFirst().trimmed();
-    }
-
+    const QString portText = parser.value(portOption).trimmed();
     bool portOk = false;
     const uint parsedPort = portText.toUInt(&portOk);
     if (!portOk || parsedPort == 0 || parsedPort > 65535) {

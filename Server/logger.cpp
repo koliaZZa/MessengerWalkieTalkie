@@ -86,9 +86,14 @@ void Logger::rotateIfNeeded()
 
     m_file.close();
 
-    const QString rotatedName = QStringLiteral("logs/server_%1.log")
-                                    .arg(QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss"));
-    QFile::rename("logs/server.log", rotatedName);
+    const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_hhmmss_zzz"));
+    QString rotatedName = QStringLiteral("logs/server_%1.log").arg(timestamp);
+    int suffix = 1;
+    while (QFile::exists(rotatedName)) {
+        rotatedName = QStringLiteral("logs/server_%1_%2.log").arg(timestamp).arg(suffix);
+        ++suffix;
+    }
+    QFile::rename(QStringLiteral("logs/server.log"), rotatedName);
 
     m_file.setFileName("logs/server.log");
     m_file.open(QIODevice::Append | QIODevice::Text);

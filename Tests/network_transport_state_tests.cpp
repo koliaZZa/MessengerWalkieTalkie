@@ -8,7 +8,7 @@ class NetworkTransportStateTests : public QObject
 
 private slots:
     void connectAndReconnectFlow();
-    void reliableRetryAndAckFlow();
+    void trackedRetryAndAckFlow();
     void manualDisconnectAndHeartbeat();
 };
 
@@ -28,33 +28,33 @@ void NetworkTransportStateTests::connectAndReconnectFlow()
     QCOMPARE(state.scheduleReconnect(), 1000);
 }
 
-void NetworkTransportStateTests::reliableRetryAndAckFlow()
+void NetworkTransportStateTests::trackedRetryAndAckFlow()
 {
     NetworkTransportState state;
     state.startConnection(QStringLiteral("chat.example"), 7777);
 
     QJsonObject packet{{QStringLiteral("type"), QStringLiteral("private")}, {QStringLiteral("id"), QStringLiteral("msg-1")}};
     packet.insert(QStringLiteral("seq"), static_cast<qint64>(state.nextOutgoingSequence()));
-    state.trackReliableMessage(QStringLiteral("msg-1"), packet, 1000);
+    state.trackTrackedPacket(QStringLiteral("msg-1"), packet, 1000);
 
-    QCOMPARE(state.pendingReliableCount(), 1);
+    QCOMPARE(state.pendingTrackedCount(), 1);
     QVERIFY(!state.isDuplicateIncomingSequence(1));
     state.markIncomingSequence(1);
     QVERIFY(state.isDuplicateIncomingSequence(1));
     QVERIFY(!state.isDuplicateIncomingSequence(2));
 
-    RetryActions actions = state.collectRetryActions(2999);
+    TrackedRetryActions actions = state.collectTrackedRetryActions(2999);
     QVERIFY(actions.resendPackets.isEmpty());
     QVERIFY(actions.droppedMessageIds.isEmpty());
 
-    actions = state.collectRetryActions(3000);
+    actions = state.collectTrackedRetryActions(3000);
     QCOMPARE(actions.resendPackets.size(), 1);
     QCOMPARE(actions.resendPackets.constFirst().value(QStringLiteral("id")).toString(), QStringLiteral("msg-1"));
     QVERIFY(actions.droppedMessageIds.isEmpty());
 
-    state.acknowledgeReliableMessage(QStringLiteral("msg-1"));
-    QCOMPARE(state.pendingReliableCount(), 0);
-    actions = state.collectRetryActions(7000);
+    state.acknowledgeTrackedPacket(QStringLiteral("msg-1"));
+    QCOMPARE(state.pendingTrackedCount(), 0);
+    actions = state.collectTrackedRetryActions(7000);
     QVERIFY(actions.resendPackets.isEmpty());
     QVERIFY(actions.droppedMessageIds.isEmpty());
 }
@@ -65,14 +65,14 @@ void NetworkTransportStateTests::manualDisconnectAndHeartbeat()
     state.startConnection(QStringLiteral("srv"), 6000);
     state.incomingBuffer().append("partial");
     QJsonObject packet{{QStringLiteral("type"), QStringLiteral("message")}, {QStringLiteral("id"), QStringLiteral("msg-2")}};
-    state.trackReliableMessage(QStringLiteral("msg-2"), packet, 1000);
+    state.trackTrackedPacket(QStringLiteral("msg-2"), packet, 1000);
 
     state.prepareDisconnect();
     QVERIFY(!state.canReconnect());
     QVERIFY(state.consumeManualDisconnect());
     QVERIFY(!state.consumeManualDisconnect());
     QVERIFY(state.incomingBuffer().isEmpty());
-    QCOMPARE(state.pendingReliableCount(), 0);
+    QCOMPARE(state.pendingTrackedCount(), 0);
 
     state.startConnection(QStringLiteral("srv"), 6000);
     state.markConnected(10'000);

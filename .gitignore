@@ -80,3 +80,12 @@ CMakeLists.txt.user*
 .rcc/
 .uic/
 /build*/
+
+# Runtime artifacts
+/logs/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
